@@ -238,6 +238,13 @@ public static class KernelPthreadCompatExports
     public static int PthreadCondInit(CpuContext ctx) => PthreadCondInitCore(ctx, ctx[CpuRegister.Rdi]);
 
     [SysAbiExport(
+        Nid = "0TyVk4MSLt0",
+        ExportName = "pthread_cond_init",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadCondInit(CpuContext ctx) => PthreadCondInitCore(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(
         Nid = "g+PZd2hiacg",
         ExportName = "scePthreadCondDestroy",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -285,6 +292,13 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PosixPthreadCondBroadcast(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: true);
+
+    [SysAbiExport(
+        Nid = "2MOy+rUfuhQ",
+        ExportName = "pthread_cond_signal",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadCondSignal(CpuContext ctx) => PthreadCondSignalCore(ctx, ctx[CpuRegister.Rdi], broadcast: false);
 
     [SysAbiExport(
         Nid = "m5-2bsNfv7s",
@@ -404,6 +418,23 @@ public static class KernelPthreadCompatExports
                 {
                     state.RecursionCount++;
                     TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (state.Type is MutexTypeNormal or MutexTypeAdaptiveNp)
+                {
+                    if (tryOnly)
+                    {
+                        TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
+                        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+                    }
+
+                    // Normal/adaptive mutexes do not report EDEADLK on self-lock.
+                    // Under the current single-host-thread guest execution model,
+                    // treating them as nested ownership keeps init paths moving
+                    // without turning a would-block path into a hard error.
+                    state.RecursionCount++;
+                    TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
 

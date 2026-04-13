@@ -264,22 +264,14 @@ public static class KernelExports
         ExportName = "open",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int Open(CpuContext ctx)
-    {
-        ctx[CpuRegister.Rax] = unchecked((ulong)Interlocked.Increment(ref _nextFileDescriptor));
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
+    public static int Open(CpuContext ctx) => KernelMemoryCompatExports.KernelOpenUnderscore(ctx);
 
     [SysAbiExport(
         Nid = "1G3lF1Gg1k8",
         ExportName = "sceKernelOpen",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelOpen(CpuContext ctx)
-    {
-        ctx[CpuRegister.Rax] = unchecked((ulong)Interlocked.Increment(ref _nextFileDescriptor));
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
+    public static int KernelOpen(CpuContext ctx) => KernelMemoryCompatExports.KernelOpenUnderscore(ctx);
 
     [SysAbiExport(
         Nid = "hcuQgD53UxM",

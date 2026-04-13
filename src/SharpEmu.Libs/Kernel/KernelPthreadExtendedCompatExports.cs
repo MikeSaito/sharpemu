@@ -29,8 +29,7 @@ public static class KernelPthreadExtendedCompatExports
     private static int _nextTlsKey = 1;
     private static long _nextSyntheticRwlockHandleId = 1;
 
-    [ThreadStatic]
-    private static Dictionary<int, ulong>? _threadLocalSpecific;
+    private static readonly Dictionary<ulong, Dictionary<int, ulong>> _threadLocalSpecific = new();
 
     private sealed class ThreadState
     {
@@ -855,9 +854,13 @@ public static class KernelPthreadExtendedCompatExports
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
+
+            foreach (var entry in _threadLocalSpecific)
+            {
+                entry.Value.Remove(key);
+            }
         }
 
-        _threadLocalSpecific?.Remove(key);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -878,16 +881,23 @@ public static class KernelPthreadExtendedCompatExports
     {
         var key = unchecked((int)ctx[CpuRegister.Rdi]);
         var value = ctx[CpuRegister.Rsi];
+        var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         lock (_stateGate)
         {
             if (!_tlsKeys.TryGetValue(key, out _))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
+
+            if (!_threadLocalSpecific.TryGetValue(currentThreadHandle, out var values))
+            {
+                values = new Dictionary<int, ulong>();
+                _threadLocalSpecific[currentThreadHandle] = values;
+            }
+
+            values[key] = value;
         }
 
-        _threadLocalSpecific ??= new Dictionary<int, ulong>();
-        _threadLocalSpecific[key] = value;
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -907,6 +917,8 @@ public static class KernelPthreadExtendedCompatExports
     public static int PosixPthreadGetspecific(CpuContext ctx)
     {
         var key = unchecked((int)ctx[CpuRegister.Rdi]);
+        var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
+        ulong value = 0;
         lock (_stateGate)
         {
             if (!_tlsKeys.TryGetValue(key, out _))
@@ -914,12 +926,15 @@ public static class KernelPthreadExtendedCompatExports
                 ctx[CpuRegister.Rax] = 0;
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
+
+            if (_threadLocalSpecific.TryGetValue(currentThreadHandle, out var values) &&
+                values.TryGetValue(key, out var storedValue))
+            {
+                value = storedValue;
+            }
         }
 
-        ctx[CpuRegister.Rax] =
-            _threadLocalSpecific is not null && _threadLocalSpecific.TryGetValue(key, out var value)
-                ? value
-                : 0UL;
+        ctx[CpuRegister.Rax] = value;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
