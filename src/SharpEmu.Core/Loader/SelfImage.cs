@@ -21,7 +21,10 @@ public sealed class SelfImage
         IReadOnlyList<ulong>? initializerFunctions = null,
         ulong initFunctionEntryPoint = 0,
         ulong imageBase = 0,
-        ulong procParamAddress = 0)
+        ulong procParamAddress = 0,
+        string? title = null,
+        string? titleId = null,
+        string? version = null)
     {
         ArgumentNullException.ThrowIfNull(programHeaders);
         ArgumentNullException.ThrowIfNull(mappedRegions);
@@ -38,6 +41,9 @@ public sealed class SelfImage
         InitFunctionEntryPoint = initFunctionEntryPoint;
         _imageBase = imageBase;
         ProcParamAddress = procParamAddress;
+        Title = title;
+        TitleId = titleId;
+        Version = version;
     }
 
     public bool IsSelf { get; }
@@ -63,4 +69,10 @@ public sealed class SelfImage
     public ulong EntryPoint => ElfHeader.EntryPoint + _imageBase;
 
     public ulong ProcParamAddress { get; }
+
+    public string? Title { get; }
+
+    public string? TitleId { get; }
+
+    public string? Version { get; }
 }

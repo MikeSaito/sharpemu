@@ -144,10 +144,9 @@ public sealed class SelfLoader : ISelfLoader
             throw new InvalidDataException("Input image is empty.");
         }
 
-        if (readParamJson)
-        {
-            TryLoadParamJson(fs, mountRoot);
-        }
+        var applicationInfo = readParamJson
+            ? TryLoadParamJson(fs, mountRoot)
+            : default;
 
         if (clearVirtualMemory)
         {
@@ -270,15 +269,20 @@ public sealed class SelfLoader : ISelfLoader
             initializerFunctions,
             initFunctionEntryPoint,
             imageBase,
-            procParamAddress);
+            procParamAddress,
+            applicationInfo.Title,
+            applicationInfo.TitleId,
+            applicationInfo.Version);
     }
 
-    private static void TryLoadParamJson(IFileSystem? fs, string? mountRoot)
+    private static (string? Title, string? TitleId, string? Version) TryLoadParamJson(
+        IFileSystem? fs,
+        string? mountRoot)
     {
         if (fs == null)
         {
             Console.WriteLine("[LOADER] param.json not found (no filesystem provided).");
-            return;
+            return default;
         }
 
         string[] possiblePaths = string.IsNullOrEmpty(mountRoot)
@@ -298,12 +302,16 @@ public sealed class SelfLoader : ISelfLoader
         if (foundPath == null)
         {
             Console.WriteLine("[LOADER] param.json not found (no root path / unknown layout).");
-            return;
+            return default;
         }
 
-        var (title, titleId, ver) = Ps5ParamJsonReader.TryReadPs5Param(fs, foundPath);
+        var applicationInfo = Ps5ParamJsonReader.TryReadPs5Param(fs, foundPath);
         Console.WriteLine($"[LOADER] Loading param.json at {foundPath}");
-        Console.WriteLine($"[LOADER] Title: {title ?? "(unknown)"}, TitleId: {titleId ?? "(unknown)"}, Version: {ver ?? "(unknown)"}");
+        Console.WriteLine(
+            $"[LOADER] Title: {applicationInfo.Title ?? "(unknown)"}, " +
+            $"TitleId: {applicationInfo.TitleId ?? "(unknown)"}, " +
+            $"Version: {applicationInfo.Version ?? "(unknown)"}");
+        return applicationInfo;
     }
 
     private static LoadContext ParseLayout(ReadOnlySpan<byte> imageData)
