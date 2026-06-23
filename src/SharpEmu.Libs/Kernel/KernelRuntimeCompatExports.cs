@@ -106,11 +106,32 @@ public static class KernelRuntimeCompatExports
         }
 
         var rbx = ctx[CpuRegister.Rbx];
+        var r12 = ctx[CpuRegister.R12];
+        var r13 = ctx[CpuRegister.R13];
         var lockAddress = rbx == 0 ? 0 : rbx + 0xF78;
         var lockText = "unreadable";
         if (lockAddress != 0 && ctx.TryReadUInt64(lockAddress, out var lockValue))
         {
             lockText = $"0x{lockValue:X16}";
+        }
+
+        var schedulerText = "unreadable";
+        if (r12 != 0 && ctx.TryReadUInt64(r12 + 8, out var schedulerAddress))
+        {
+            schedulerText = $"0x{schedulerAddress:X16}";
+        }
+
+        var waitValueText = "unreadable";
+        if (r13 != 0 && ctx.TryReadUInt64(r13, out var waitValue))
+        {
+            waitValueText = $"0x{waitValue:X16}";
+        }
+
+        var callerReturnText = "unreadable";
+        var rbp = ctx[CpuRegister.Rbp];
+        if (rbp != 0 && ctx.TryReadUInt64(rbp + 8, out var callerReturn))
+        {
+            callerReturnText = $"0x{callerReturn:X16}";
         }
 
         var returnRip = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
@@ -120,7 +141,7 @@ public static class KernelRuntimeCompatExports
         var fiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
 
         Console.Error.WriteLine(
-            $"[LOADER][TRACE] usleep#{count}: usec={micros} ret=0x{returnRip:X16} thread=0x{thread:X16} fiber=0x{fiber:X16} rbx=0x{rbx:X16} lock@+F78=0x{lockAddress:X16}:{lockText} r13=0x{ctx[CpuRegister.R13]:X16} r14=0x{ctx[CpuRegister.R14]:X16} r15=0x{ctx[CpuRegister.R15]:X16}");
+            $"[LOADER][TRACE] usleep#{count}: usec={micros} ret=0x{returnRip:X16} caller={callerReturnText} thread=0x{thread:X16} fiber=0x{fiber:X16} rbx=0x{rbx:X16} lock@+F78=0x{lockAddress:X16}:{lockText} r12=0x{r12:X16} scheduler@+8={schedulerText} r13=0x{r13:X16}:{waitValueText} r14=0x{ctx[CpuRegister.R14]:X16} r15=0x{ctx[CpuRegister.R15]:X16}");
     }
 
     [SysAbiExport(

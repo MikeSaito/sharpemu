@@ -186,6 +186,35 @@ public static class KernelPthreadExtendedCompatExports
     }
 
     [SysAbiExport(
+        Nid = "rcrVFJsQWRY",
+        ExportName = "scePthreadGetaffinity",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadGetaffinity(CpuContext ctx)
+    {
+        var thread = ctx[CpuRegister.Rdi];
+        var outMaskAddress = ctx[CpuRegister.Rsi];
+        if (thread == 0 || outMaskAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        ulong affinityMask;
+        lock (_stateGate)
+        {
+            affinityMask = GetOrCreateThreadStateLocked(thread).AffinityMask;
+        }
+
+        if (!ctx.TryWriteUInt64(outMaskAddress, affinityMask))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "1tKyG7RlMJo",
         ExportName = "scePthreadGetprio",
         Target = Generation.Gen4 | Generation.Gen5,

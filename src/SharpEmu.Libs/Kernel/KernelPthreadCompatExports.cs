@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using System.Buffers.Binary;
 using System.Threading;
 using System.Diagnostics.CodeAnalysis;
 
@@ -19,11 +20,15 @@ public static class KernelPthreadCompatExports
     private const int MutexAttrObjectSize = 0x40;
     private const int CondObjectSize = 0x100;
     private const int DefaultSpuriousCondWakeMilliseconds = 1;
+    private const int PthreadOnceUninitialized = 0;
+    private const int PthreadOnceInProgress = 1;
+    private const int PthreadOnceDone = 2;
 
     private static readonly object _stateGate = new();
     private static readonly Dictionary<ulong, PthreadMutexState> _mutexStates = new();
     private static readonly Dictionary<ulong, PthreadMutexAttrState> _mutexAttrStates = new();
     private static readonly Dictionary<ulong, PthreadCondState> _condStates = new();
+    private static readonly Dictionary<ulong, object> _onceGates = new();
     private static readonly HashSet<ulong> _condAttrStates = new();
 
     private sealed class PthreadMutexState
@@ -56,6 +61,13 @@ public static class KernelPthreadCompatExports
         TracePthreadSelf(ctx, currentThreadHandle);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    [SysAbiExport(
+        Nid = "EotR8a3ASf4",
+        ExportName = "pthread_self",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadSelf(CpuContext ctx) => PthreadSelf(ctx);
 
     [SysAbiExport(
         Nid = "3PtV6p3QNX4",
@@ -338,6 +350,93 @@ public static class KernelPthreadCompatExports
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "14bOACANTBo",
+        ExportName = "scePthreadOnce",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadOnce(CpuContext ctx)
+    {
+        var onceAddress = ctx[CpuRegister.Rdi];
+        var initRoutine = ctx[CpuRegister.Rsi];
+        if (onceAddress == 0 || initRoutine == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryReadInt32(ctx, onceAddress, out var onceValue))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (onceValue == PthreadOnceDone)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+        }
+
+        var gate = GetPthreadOnceGate(onceAddress);
+        var shouldCall = false;
+        lock (gate)
+        {
+            if (!TryReadInt32(ctx, onceAddress, out onceValue))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            while (onceValue == PthreadOnceInProgress)
+            {
+                Monitor.Wait(gate, TimeSpan.FromMilliseconds(1));
+                if (!TryReadInt32(ctx, onceAddress, out onceValue))
+                {
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+            }
+
+            if (onceValue != PthreadOnceDone)
+            {
+                if (!TryWriteInt32(ctx, onceAddress, PthreadOnceInProgress))
+                {
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+
+                shouldCall = true;
+            }
+        }
+
+        if (shouldCall)
+        {
+            var scheduler = GuestThreadExecution.Scheduler;
+            string? error = null;
+            if (scheduler is null ||
+                !scheduler.TryCallGuestFunction(ctx, initRoutine, 0, 0, 0, 0, "pthread_once", out error))
+            {
+                lock (gate)
+                {
+                    _ = TryWriteInt32(ctx, onceAddress, PthreadOnceUninitialized);
+                    Monitor.PulseAll(gate);
+                }
+
+                TracePthreadOnce(onceAddress, initRoutine, "failed", error);
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+            }
+
+            lock (gate)
+            {
+                if (!TryWriteInt32(ctx, onceAddress, PthreadOnceDone))
+                {
+                    _ = TryWriteInt32(ctx, onceAddress, PthreadOnceUninitialized);
+                    Monitor.PulseAll(gate);
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+
+                Monitor.PulseAll(gate);
+            }
+        }
+
+        TracePthreadOnce(onceAddress, initRoutine, shouldCall ? "call" : "done", null);
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     private static int PthreadMutexInitCore(CpuContext ctx, ulong mutexAddress, ulong attrAddress)
@@ -1136,6 +1235,46 @@ public static class KernelPthreadCompatExports
         };
     }
 
+    private static object GetPthreadOnceGate(ulong onceAddress)
+    {
+        lock (_stateGate)
+        {
+            if (!_onceGates.TryGetValue(onceAddress, out var gate))
+            {
+                gate = new object();
+                _onceGates[onceAddress] = gate;
+            }
+
+            return gate;
+        }
+    }
+
+    private static int SetReturn(CpuContext ctx, OrbisGen2Result result)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);
+        return (int)result;
+    }
+
+    private static bool TryReadInt32(CpuContext ctx, ulong address, out int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+        return true;
+    }
+
+    private static bool TryWriteInt32(CpuContext ctx, ulong address, int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
+    }
+
     private static bool CreateImplicitMutexState(CpuContext ctx, ulong mutexAddress, int type, out ulong resolvedAddress, [NotNullWhen(true)] out PthreadMutexState? state)
     {
         var createdState = new PthreadMutexState
@@ -1202,6 +1341,18 @@ public static class KernelPthreadCompatExports
         var currentThreadId = KernelPthreadState.GetCurrentThreadUniqueId();
         Console.Error.WriteLine(
             $"[LOADER][TRACE] pthread_self: stale_rdi=0x{ctx[CpuRegister.Rdi]:X16} thread=0x{currentThreadHandle:X16} tid=0x{currentThreadId:X16}");
+    }
+
+    private static void TracePthreadOnce(ulong onceAddress, ulong initRoutine, string operation, string? error)
+    {
+        if (!ShouldTracePthread())
+        {
+            return;
+        }
+
+        var suffix = string.IsNullOrWhiteSpace(error) ? string.Empty : $" error={error}";
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] pthread_once_{operation}: once=0x{onceAddress:X16} init=0x{initRoutine:X16}{suffix}");
     }
 
     private static void TracePthreadMutex(CpuContext ctx, string operation, ulong mutexAddress, ulong resolvedAddress, PthreadMutexState? state, ulong currentThreadId, int result)
