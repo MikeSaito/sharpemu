@@ -527,7 +527,10 @@ public sealed partial class DirectExecutionBackend
 		if (dispatchIndex % 100000 == 0)
 		{
 			Console.Error.WriteLine(
-				$"[LOADER][TRACE] Import#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid})");
+				$"[LOADER][TRACE] Import#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
+				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+				$"ret=0x{returnRip:X16}");
 		}
 
 		var previousImportCallFrame = GuestThreadExecution.EnterImportCallFrame(
