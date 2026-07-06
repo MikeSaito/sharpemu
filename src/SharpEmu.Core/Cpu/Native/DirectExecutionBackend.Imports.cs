@@ -338,9 +338,14 @@ public sealed partial class DirectExecutionBackend
 				{
 					orbisGen2Result = DispatchBootstrapBridge();
 				}
-				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal))
+				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal) ||
+					string.Equals(importStubEntry.Nid, "LwG8g3niqwA", StringComparison.Ordinal))
 				{
 					orbisGen2Result = DispatchKernelDynlibDlsym();
+				}
+				else if (string.Equals(importStubEntry.Nid, "r8mvOaWdi28", StringComparison.Ordinal))
+				{
+					orbisGen2Result = DispatchIl2CppApiLookupSymbol();
 				}
 				else if (importStubEntry.Export is { } cachedExport &&
 					(cachedExport.Target & cpuContext.TargetGeneration) != 0)
@@ -1180,8 +1185,11 @@ public sealed partial class DirectExecutionBackend
 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
 			return OrbisGen2Result.ORBIS_GEN2_OK;
 		}
-		if (!TryResolveRuntimeSymbolAddress(symbolName, out var resolvedAddress))
+		if (!TryResolveRuntimeSymbolAddress(symbolName, out var resolvedAddress) &&
+			!TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress))
 		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} symbol='{symbolName}'");
 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
 			return OrbisGen2Result.ORBIS_GEN2_OK;
 		}
@@ -1192,6 +1200,62 @@ public sealed partial class DirectExecutionBackend
 		}
 		cpuContext[CpuRegister.Rax] = 0uL;
 		return OrbisGen2Result.ORBIS_GEN2_OK;
+	}
+
+	private bool TryResolveRuntimeSymbolAlias(string symbolName, out ulong address)
+	{
+		address = 0;
+		var alias = symbolName switch
+		{
+			"scriptingGetMem" => "malloc",
+			"scriptingFreeMem" => "free",
+			"scriptingRealloc" => "realloc",
+			"scriptingCalloc" => "calloc",
+			_ => null,
+		};
+
+		return alias != null && TryResolveRuntimeSymbolAddress(alias, out address);
+	}
+
+	private OrbisGen2Result DispatchIl2CppApiLookupSymbol()
+	{
+		var cpuContext = ActiveCpuContext;
+		if (cpuContext == null)
+		{
+			return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+		}
+
+		var symbolNameAddress = cpuContext[CpuRegister.Rdi];
+		var outputAddress = cpuContext[CpuRegister.Rsi];
+		if (!TryReadAsciiZ(symbolNameAddress, 512, out var symbolName) ||
+			outputAddress == 0 ||
+			!TryResolveIl2CppApiAddress(symbolName, out var resolvedAddress) ||
+			!TryWriteUInt64Compat(outputAddress, resolvedAddress))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] il2cpp_api_lookup_symbol failed: name='{symbolName}' out=0x{outputAddress:X16}");
+			if (outputAddress != 0)
+			{
+				_ = TryWriteUInt64Compat(outputAddress, 0);
+			}
+
+			cpuContext[CpuRegister.Rax] = ulong.MaxValue;
+			return OrbisGen2Result.ORBIS_GEN2_OK;
+		}
+
+		cpuContext[CpuRegister.Rax] = 0;
+		return OrbisGen2Result.ORBIS_GEN2_OK;
+	}
+
+	private bool TryResolveIl2CppApiAddress(string symbolName, out ulong address)
+	{
+		if (TryResolveRuntimeSymbolAddress(symbolName, out address))
+		{
+			return true;
+		}
+
+		return Aerolib.Instance.TryGetByExportName(symbolName, out var symbol) &&
+			TryResolveRuntimeSymbolAddress(symbol.Nid, out address);
 	}
 
 	private OrbisGen2Result DispatchBootstrapBridge()

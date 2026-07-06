@@ -543,6 +543,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         {
             Path.Combine(ebootDirectory, "sce_module"),
             Path.Combine(ebootDirectory, "sce_modules"),
+            Path.Combine(ebootDirectory, "Media", "Modules"),
         }
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .Where(Directory.Exists)
@@ -554,7 +555,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         }
 
         var allModulePaths = moduleDirectories
-            .SelectMany(Directory.EnumerateFiles)
+            .SelectMany(directory => Directory
+                .EnumerateFiles(directory)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
             .Where(path =>
             {
                 var extension = Path.GetExtension(path);
@@ -562,7 +565,6 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
                        string.Equals(extension, ".sprx", StringComparison.OrdinalIgnoreCase);
             })
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
         var modulePaths = allModulePaths

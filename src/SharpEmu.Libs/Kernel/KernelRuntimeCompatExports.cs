@@ -752,6 +752,7 @@ public static class KernelRuntimeCompatExports
             _nextReservedVirtualBase = Math.Max(_nextReservedVirtualBase, mappedAddress + length);
         }
 
+        KernelMemoryCompatExports.RegisterReservedVirtualRange(mappedAddress, length);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

@@ -244,6 +244,36 @@ public static class SaveDataExports
         }
     }
 
+    private static int _nextTransactionResource;
+    [SysAbiExport(
+        Nid = "gjRZNnw0JPE",
+        ExportName = "sceSaveDataCreateTransactionResource",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataCreateTransactionResource(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var reserved = ctx[CpuRegister.Rsi];
+        var resourceAddress = ctx[CpuRegister.Rdx];
+
+        if (resourceAddress == 0)
+        {
+            return SetReturn(ctx, OrbisSaveDataErrorParameter);
+        }
+
+        var id = (uint)Interlocked.Increment(ref _nextTransactionResource);
+
+        if (!TryWriteUInt32(ctx, resourceAddress, id))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceSaveData(
+            $"create_transaction_resource user={userId} reserved=0x{reserved:X} resource_addr=0x{resourceAddress:X} id={id}");
+
+        return SetReturn(ctx, 0);
+    }
+
     private static bool TryReadSearchCond(CpuContext ctx, ulong address, out SearchCond cond)
     {
         cond = default;

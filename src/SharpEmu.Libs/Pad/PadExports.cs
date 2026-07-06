@@ -160,6 +160,16 @@ public static class PadExports
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    [SysAbiExport(
+    Nid = "W2G-yoyMF5U",
+    ExportName = "scePadSetVibrationMode",
+    Target = Generation.Gen4 | Generation.Gen5,
+    LibraryName = "libScePad")]
+    public static int PadSetVibrationMode(CpuContext ctx)
+    {
+        return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
     private static bool WriteNeutralPadData(CpuContext ctx, ulong dataAddress)
     {
         Span<byte> data = stackalloc byte[PadDataSize];

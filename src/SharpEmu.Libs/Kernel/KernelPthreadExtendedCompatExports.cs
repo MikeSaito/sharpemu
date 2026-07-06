@@ -718,6 +718,35 @@ public static class KernelPthreadExtendedCompatExports
     }
 
     [SysAbiExport(
+        Nid = "FXPWHNk8Of0",
+        ExportName = "scePthreadAttrGetschedparam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadAttrGetschedparam(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        var schedParamAddress = ctx[CpuRegister.Rsi];
+        if (attrAddress == 0 || schedParamAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        PthreadAttrState state;
+        lock (_stateGate)
+        {
+            state = GetOrCreateAttrStateLocked(attrAddress);
+        }
+
+        if (!TryWriteInt32(ctx, schedParamAddress, state.SchedPriority))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "DzES9hQF4f4",
         ExportName = "scePthreadAttrSetschedparam",
         Target = Generation.Gen4 | Generation.Gen5,
