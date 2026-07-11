@@ -168,6 +168,7 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly object _gate = new();
     private static readonly Queue<object> _pendingGuestWork = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
+    private static readonly Dictionary<ulong, uint> _gpuGuestImages = new();
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
     private static Thread? _thread;
@@ -600,7 +601,7 @@ internal static unsafe class VulkanVideoPresenter
         return true;
     }
 
-    internal static bool IsGuestImageAvailable(
+    internal static bool IsGpuGuestImageAvailable(
         ulong address,
         uint format,
         uint numberType)
@@ -613,7 +614,7 @@ internal static unsafe class VulkanVideoPresenter
 
         lock (_gate)
         {
-            return _availableGuestImages.TryGetValue(address, out var availableFormat) &&
+            return _gpuGuestImages.TryGetValue(address, out var availableFormat) &&
                 availableFormat == guestFormat;
         }
     }
@@ -971,6 +972,8 @@ internal static unsafe class VulkanVideoPresenter
             public VulkanGuestSampler SamplerState;
             public Sampler Sampler;
             public GuestImageResource? GuestImage;
+            public ulong CpuContentFingerprint;
+            public bool UpdatesCpuContent;
         }
 
         private sealed class GlobalBufferResource
@@ -1009,6 +1012,8 @@ internal static unsafe class VulkanVideoPresenter
             public Framebuffer Framebuffer;
             public bool Initialized;
             public bool InitialUploadPending;
+            public bool IsCpuBacked;
+            public ulong CpuContentFingerprint;
         }
 
         private sealed record PendingGuestSubmission(
@@ -2838,6 +2843,11 @@ internal static unsafe class VulkanVideoPresenter
                         $"tile={texture.TileMode} format={vkFormat}");
                 }
 
+                if (TryCreateCpuTextureRefreshResource(texture, guestImage, view, out var refresh))
+                {
+                    return refresh;
+                }
+
                 return new TextureResource
                 {
                     Address = texture.Address,
@@ -2853,6 +2863,71 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             return CreateTextureResource(texture);
+        }
+
+        private bool TryCreateCpuTextureRefreshResource(
+            VulkanGuestDrawTexture texture,
+            GuestImageResource guestImage,
+            ImageView view,
+            out TextureResource resource)
+        {
+            resource = default!;
+            if (!guestImage.IsCpuBacked ||
+                guestImage.Width != texture.Width ||
+                guestImage.Height != texture.Height ||
+                guestImage.MipLevels != 1 ||
+                texture.RgbaPixels.Length == 0)
+            {
+                return false;
+            }
+
+            var rowLength = texture.TileMode == 0
+                ? Math.Max(texture.Pitch, texture.Width)
+                : texture.Width;
+            var expectedSize = GetTextureByteCount(texture.Format, rowLength, texture.Height);
+            if (expectedSize == 0 || expectedSize > int.MaxValue)
+            {
+                return false;
+            }
+
+            var pixels = texture.RgbaPixels.Length == (int)expectedSize
+                ? texture.RgbaPixels
+                : CreateFallbackTexturePixels(texture.Format, rowLength, texture.Height, expectedSize);
+            var fingerprint = ComputeTextureContentFingerprint(pixels);
+            if ((guestImage.Initialized || guestImage.InitialUploadPending) &&
+                guestImage.CpuContentFingerprint == fingerprint)
+            {
+                return false;
+            }
+
+            var uploadPixels = texture.Format == 13
+                ? ExpandRgb32Pixels(pixels)
+                : pixels;
+            var debugName = TextureDebugName(texture, guestImage.Format);
+            var (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
+                uploadPixels,
+                $"{debugName} refresh staging");
+            TraceVulkanShader(
+                $"vk.texture_refresh addr=0x{texture.Address:X16} " +
+                $"size={texture.Width}x{texture.Height} bytes={uploadPixels.Length}");
+            resource = new TextureResource
+            {
+                Address = texture.Address,
+                StagingBuffer = stagingBuffer,
+                StagingMemory = stagingMemory,
+                Image = guestImage.Image,
+                View = view,
+                Width = guestImage.Width,
+                Height = guestImage.Height,
+                RowLength = rowLength,
+                DstSelect = texture.DstSelect,
+                NeedsUpload = true,
+                SamplerState = texture.Sampler,
+                GuestImage = guestImage,
+                CpuContentFingerprint = fingerprint,
+                UpdatesCpuContent = true,
+            };
+            return true;
         }
 
         private static bool IsCompatibleGuestImageAlias(
@@ -3096,24 +3171,11 @@ internal static unsafe class VulkanVideoPresenter
             var uploadPixels = texture.Format == 13
                 ? ExpandRgb32Pixels(pixels)
                 : pixels;
-            var uploadSize = (ulong)uploadPixels.Length;
+            var contentFingerprint = ComputeTextureContentFingerprint(pixels);
 
-            var stagingBuffer = CreateBuffer(
-                uploadSize,
-                BufferUsageFlags.TransferSrcBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-                out var stagingMemory);
-            void* mapped;
-            Check(_vk.MapMemory(_device, stagingMemory, 0, uploadSize, 0, &mapped), "vkMapMemory(texture)");
-            fixed (byte* source = uploadPixels)
-            {
-                System.Buffer.MemoryCopy(
-                    source,
-                    mapped,
-                    uploadPixels.Length,
-                    uploadPixels.Length);
-            }
-            _vk.UnmapMemory(_device, stagingMemory);
+            var (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
+                uploadPixels,
+                $"{TextureDebugName(texture, vkFormat)} staging");
 
             var supportsAttachmentUsage = !IsBlockCompressedFormat(vkFormat);
             var imageInfo = new ImageCreateInfo
@@ -3163,7 +3225,6 @@ internal static unsafe class VulkanVideoPresenter
             };
             Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(texture)");
             var debugName = TextureDebugName(texture, vkFormat);
-            SetDebugName(ObjectType.Buffer, stagingBuffer.Handle, $"{debugName} staging");
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
             SetDebugName(ObjectType.ImageView, view.Handle, $"{debugName} view");
             var resource = new TextureResource
@@ -3181,6 +3242,8 @@ internal static unsafe class VulkanVideoPresenter
                 NeedsUpload = true,
                 OwnsStorage = true,
                 SamplerState = texture.Sampler,
+                CpuContentFingerprint = contentFingerprint,
+                UpdatesCpuContent = texture.Address != 0,
             };
 
             if (texture.Address != 0 &&
@@ -3197,6 +3260,8 @@ internal static unsafe class VulkanVideoPresenter
                     Memory = imageMemory,
                     View = view,
                     InitialUploadPending = true,
+                    IsCpuBacked = true,
+                    CpuContentFingerprint = contentFingerprint,
                 };
                 _guestImages.Add(texture.Address, guestImage);
                 resource.OwnsStorage = false;
@@ -3209,11 +3274,47 @@ internal static unsafe class VulkanVideoPresenter
                     if (guestFormat != 0)
                     {
                         _availableGuestImages[texture.Address] = guestFormat;
+                        _gpuGuestImages.Remove(texture.Address);
                     }
                 }
             }
 
             return resource;
+        }
+
+        private (VkBuffer Buffer, DeviceMemory Memory) CreateTextureStagingBuffer(
+            byte[] pixels,
+            string debugName)
+        {
+            var size = (ulong)pixels.Length;
+            var buffer = CreateBuffer(
+                size,
+                BufferUsageFlags.TransferSrcBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                out var memory);
+            void* mapped;
+            Check(_vk.MapMemory(_device, memory, 0, size, 0, &mapped), "vkMapMemory(texture)");
+            fixed (byte* source = pixels)
+            {
+                System.Buffer.MemoryCopy(source, mapped, pixels.Length, pixels.Length);
+            }
+            _vk.UnmapMemory(_device, memory);
+            SetDebugName(ObjectType.Buffer, buffer.Handle, debugName);
+            return (buffer, memory);
+        }
+
+        private static ulong ComputeTextureContentFingerprint(ReadOnlySpan<byte> pixels)
+        {
+            const ulong offsetBasis = 14695981039346656037;
+            const ulong prime = 1099511628211;
+            var hash = offsetBasis;
+            foreach (var value in pixels)
+            {
+                hash ^= value;
+                hash *= prime;
+            }
+
+            return hash;
         }
 
         private void DumpTextureUpload(
@@ -4267,12 +4368,13 @@ internal static unsafe class VulkanVideoPresenter
                 RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
                 RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
 
+                var targetHasPriorContents = target.Initialized || target.InitialUploadPending;
                 var toColorAttachment = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = target.Initialized ? AccessFlags.ShaderReadBit : 0,
+                    SrcAccessMask = targetHasPriorContents ? AccessFlags.ShaderReadBit : 0,
                     DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                    OldLayout = target.Initialized
+                    OldLayout = targetHasPriorContents
                         ? ImageLayout.ShaderReadOnlyOptimal
                         : ImageLayout.Undefined,
                     NewLayout = ImageLayout.ColorAttachmentOptimal,
@@ -4283,8 +4385,8 @@ internal static unsafe class VulkanVideoPresenter
                 };
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
-                    target.Initialized
-                        ? PipelineStageFlags.FragmentShaderBit
+                    targetHasPriorContents
+                        ? PipelineStageFlags.AllCommandsBit
                         : PipelineStageFlags.TopOfPipeBit,
                     PipelineStageFlags.ColorAttachmentOutputBit,
                     0,
@@ -4337,12 +4439,15 @@ internal static unsafe class VulkanVideoPresenter
                 MarkSampledImagesInitialized(resources);
                 MarkStorageImagesInitialized(resources, traceContents: false);
 
-                var guestTextureFormat = GetGuestTextureFormat(target.Format);
+                var guestTextureFormat = VulkanVideoPresenter.GetGuestTextureFormat(
+                    work.Target.Format,
+                    work.Target.NumberType);
                 if (work.PublishTarget && guestTextureFormat != 0)
                 {
                     lock (_gate)
                     {
                         _availableGuestImages[target.Address] = guestTextureFormat;
+                        _gpuGuestImages[target.Address] = guestTextureFormat;
                     }
                 }
                 if (ShouldTraceGuestImageWriteForDiagnostics(target.Address))
@@ -4384,6 +4489,7 @@ internal static unsafe class VulkanVideoPresenter
                     lock (_gate)
                     {
                         _availableGuestImages.Remove(work.Target.Address);
+                        _gpuGuestImages.Remove(work.Target.Address);
                     }
                 }
 
@@ -4423,6 +4529,8 @@ internal static unsafe class VulkanVideoPresenter
                     existing.MipLevels == mipLevels &&
                     existing.Format == format)
                 {
+                    existing.IsCpuBacked = false;
+                    existing.CpuContentFingerprint = 0;
                     if (existing.RenderPass.Handle == 0)
                     {
                         var attachmentView = existing.MipViews.Length > 0
@@ -4448,6 +4556,7 @@ internal static unsafe class VulkanVideoPresenter
                 lock (_gate)
                 {
                     _availableGuestImages.Remove(target.Address);
+                    _gpuGuestImages.Remove(target.Address);
                 }
             }
 
@@ -5386,11 +5495,18 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
+                var hasPriorContents = texture.GuestImage is { } guestImage &&
+                    (guestImage.Initialized || guestImage.InitialUploadPending);
                 var toTransfer = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = hasPriorContents
+                        ? AccessFlags.ShaderReadBit
+                        : 0,
                     DstAccessMask = AccessFlags.TransferWriteBit,
-                    OldLayout = ImageLayout.Undefined,
+                    OldLayout = hasPriorContents
+                        ? ImageLayout.ShaderReadOnlyOptimal
+                        : ImageLayout.Undefined,
                     NewLayout = ImageLayout.TransferDstOptimal,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -5399,7 +5515,9 @@ internal static unsafe class VulkanVideoPresenter
                 };
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
-                    PipelineStageFlags.TopOfPipeBit,
+                    hasPriorContents
+                        ? PipelineStageFlags.AllCommandsBit
+                        : PipelineStageFlags.TopOfPipeBit,
                     PipelineStageFlags.TransferBit,
                     0,
                     0,
@@ -5569,6 +5687,7 @@ internal static unsafe class VulkanVideoPresenter
                     if (format != 0)
                     {
                         _availableGuestImages[texture.Address] = format;
+                        _gpuGuestImages[texture.Address] = format;
                     }
 
                     if (traceContents &&
@@ -5608,6 +5727,10 @@ internal static unsafe class VulkanVideoPresenter
 
                     guestImage.Initialized = true;
                     guestImage.InitialUploadPending = false;
+                    if (texture.UpdatesCpuContent)
+                    {
+                        guestImage.CpuContentFingerprint = texture.CpuContentFingerprint;
+                    }
                 }
             }
         }
@@ -6379,6 +6502,7 @@ internal static unsafe class VulkanVideoPresenter
             lock (_gate)
             {
                 _availableGuestImages.Clear();
+                _gpuGuestImages.Clear();
             }
             DestroySwapchainResources();
             if (_device.Handle != 0)

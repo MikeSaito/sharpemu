@@ -142,6 +142,7 @@ public static class AgcExports
     private const ulong ShaderSpecialGeUserVgprEnOffset = 0x28;
     private const uint CbSetShRegisterRangeMarker = 0x6875000D;
     private static readonly object _submitTraceGate = new();
+    private static readonly object _textureHashTraceGate = new();
     private static readonly HashSet<uint> _tracedDcbSizes = new();
     private static readonly HashSet<(ulong Es, ulong Ps, GuestDrawKind Kind)> _tracedShaderTranslations = new();
     private static readonly HashSet<(ulong Es, ulong Ps)> _tracedShaderDecodePairs = new();
@@ -149,6 +150,7 @@ public static class AgcExports
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
+    private static readonly Dictionary<(ulong Address, uint Width, uint Height), ulong> _tracedTextureHashes = [];
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
@@ -168,6 +170,10 @@ public static class AgcExports
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_SHADER"),
             "1",
             StringComparison.Ordinal);
+    private static readonly bool _traceTextureHashes = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TEXTURE_HASHES"),
+        "1",
+        StringComparison.Ordinal);
     private static long _dcbWriteDataTraceCount;
     private static long _dcbWaitRegMemTraceCount;
     private static long _createShaderTraceCount;
@@ -3747,7 +3753,6 @@ public static class AgcExports
         var sourceWidth = descriptor.TileMode == 0
             ? GetLinearTexturePitch(
                 Math.Max(descriptor.Width, descriptor.Pitch),
-                descriptor.Height,
                 descriptor.Format)
             : descriptor.Width;
         var sourceByteCount = GetTextureByteCount(
@@ -3764,7 +3769,7 @@ public static class AgcExports
 
         if (!isStorage &&
             descriptor.Address != 0 &&
-            VulkanVideoPresenter.IsGuestImageAvailable(
+            VulkanVideoPresenter.IsGpuGuestImageAvailable(
                 descriptor.Address,
                 descriptor.Format,
                 descriptor.NumberType))
@@ -3825,6 +3830,8 @@ public static class AgcExports
             return true;
         }
 
+        TraceTextureHash(descriptor, source);
+
         var nonZero = 0;
         for (var i = 0; i < source.Length; i++)
         {
@@ -3882,6 +3889,34 @@ public static class AgcExports
             IsStorage: isStorage,
             MipLevels: 1,
             MipLevel: 0);
+    }
+
+    private static void TraceTextureHash(TextureDescriptor descriptor, ReadOnlySpan<byte> source)
+    {
+        if (!_traceTextureHashes ||
+            descriptor.Address == 0 ||
+            descriptor.Width > 256 ||
+            descriptor.Height > 256)
+        {
+            return;
+        }
+
+        var hash = ComputeFingerprint(source);
+        var key = (descriptor.Address, descriptor.Width, descriptor.Height);
+        lock (_textureHashTraceGate)
+        {
+            if (_tracedTextureHashes.TryGetValue(key, out var previousHash) &&
+                previousHash == hash)
+            {
+                return;
+            }
+
+            _tracedTextureHashes[key] = hash;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.texture_hash addr=0x{descriptor.Address:X16} " +
+            $"size={descriptor.Width}x{descriptor.Height} bytes={source.Length} hash=0x{hash:X16}");
     }
 
     private static VulkanGuestSampler ToVulkanSampler(IReadOnlyList<uint> descriptor) =>
@@ -4527,23 +4562,17 @@ public static class AgcExports
             : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
     }
 
-    private static uint GetLinearTexturePitch(uint pitch, uint height, uint format)
+    private static uint GetLinearTexturePitch(uint pitch, uint format)
     {
         var bytesPerTexel = GetTextureBytesPerTexel(format);
-        if (bytesPerTexel == 0 || height == 0)
+        if (bytesPerTexel == 0)
         {
             return pitch;
         }
 
-        var pitchAlignment = Math.Max(8UL, 64UL / bytesPerTexel);
-        var alignedPitch = AlignUp(pitch, pitchAlignment);
-        var sliceAlignment = Math.Max(64UL, 256UL / bytesPerTexel);
-        while ((alignedPitch * height) % sliceAlignment != 0)
-        {
-            alignedPitch += pitchAlignment;
-        }
-
-        return checked((uint)alignedPitch);
+        // GFX10 ADDR_SW_LINEAR aligns each row to 256 bytes.
+        var pitchAlignment = Math.Max(1UL, 256UL / bytesPerTexel);
+        return checked((uint)AlignUp(pitch, pitchAlignment));
     }
 
     private static ulong AlignUp(ulong value, ulong alignment) =>
@@ -4833,9 +4862,13 @@ public static class AgcExports
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
         var lastLevel = (fields[3] >> 16) & 0xFu;
-        var pitch = fields.Count >= 5
-            ? ((fields[4] >> 13) & 0x3FFFu) + 1
-            : width;
+        // The 128-bit RDNA2 2D resource derives pitch[12:0] from width;
+        // the optional extension word only supplies pitch[13].
+        var pitch = width;
+        if (fields.Count >= 5)
+        {
+            pitch = ((((width - 1) & 0x1FFFu) | (((fields[4] >> 13) & 1u) << 13)) + 1);
+        }
         var dstSelect = fields[3] & 0xFFFu;
         if (address == 0 || width == 0 || height == 0)
         {
