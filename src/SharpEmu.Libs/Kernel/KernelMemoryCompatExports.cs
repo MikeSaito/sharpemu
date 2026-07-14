@@ -478,7 +478,7 @@ public static class KernelMemoryCompatExports
 
     [SysAbiExport(
         Nid = "LHMrG7e8G78",
-        ExportName = "wcslen",
+        ExportName = "wcsmisc",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libc")]
     public static int Wcslen(CpuContext ctx)
@@ -3013,7 +3013,7 @@ public static class KernelMemoryCompatExports
 
     [SysAbiExport(
         Nid = "4h6F1LLbTiw",
-        ExportName = "sceKernelMapFlexibleMemoryInternal",
+        ExportName = "sceKernelMapNamedFlexibleMemoryInternal",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelMapFlexibleMemoryInternal(CpuContext ctx)
