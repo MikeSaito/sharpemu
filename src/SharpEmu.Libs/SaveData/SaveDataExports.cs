@@ -29,11 +29,14 @@ public static class SaveDataExports
     private const uint MountModeCreate = 1u << 2;
     private const uint MountModeCreate2 = 1u << 5;
     private const int MountResultSize = 0x40;
+    private const int SaveDataMemorySetup2Size = 0x40;
+    private const int SaveDataMemorySetupResultSize = 0x18;
     private static readonly object _stateGate = new();
     private static readonly HashSet<int> _transactionResources = [];
     private static readonly HashSet<int> _preparedTransactionResources = [];
     private static string? _titleId;
     private static int _nextTransactionResource;
+    private static bool _initialized;
 
     public static void ConfigureApplicationInfo(string? titleId)
     {
@@ -43,6 +46,7 @@ public static class SaveDataExports
             _transactionResources.Clear();
             _preparedTransactionResources.Clear();
             _nextTransactionResource = 0;
+            _initialized = false;
         }
     }
 
@@ -56,6 +60,10 @@ public static class SaveDataExports
         try
         {
             Directory.CreateDirectory(ResolveSaveDataRoot());
+            lock (_stateGate)
+            {
+                _initialized = true;
+            }
             return ctx.SetReturn(0);
         }
         catch (IOException)
@@ -378,6 +386,111 @@ public static class SaveDataExports
         return ctx.SetReturn(0);
     }
 
+    [SysAbiExport(
+        Nid = "oQySEUfgXRA",
+        ExportName = "sceSaveDataSetupSaveDataMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetupSaveDataMemory2(CpuContext ctx)
+    {
+        var setupParamAddress = ctx[CpuRegister.Rdi];
+        var resultAddress = ctx[CpuRegister.Rsi];
+        if (setupParamAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        lock (_stateGate)
+        {
+            if (!_initialized)
+            {
+                return ctx.SetReturn(OrbisSaveDataErrorInternal);
+            }
+        }
+
+        if (!TryReadMemorySetup2(ctx, setupParamAddress, out var setup))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (setup.UserId < 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        try
+        {
+            var memoryPath = ResolveSaveMemoryPath(setup.UserId, setup.SlotId);
+            Directory.CreateDirectory(Path.GetDirectoryName(memoryPath)!);
+            var existedSize = File.Exists(memoryPath) ? new FileInfo(memoryPath).Length : 0L;
+            if (existedSize == 0 && setup.MemorySize > 0)
+            {
+                using (var stream = File.Create(memoryPath))
+                {
+                    stream.SetLength(checked((long)setup.MemorySize));
+                }
+            }
+
+            if (resultAddress != 0)
+            {
+                Span<byte> result = stackalloc byte[SaveDataMemorySetupResultSize];
+                result.Clear();
+                BinaryPrimitives.WriteUInt64LittleEndian(result, (ulong)existedSize);
+                if (!ctx.Memory.TryWrite(resultAddress, result))
+                {
+                    return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+            }
+
+            TraceSaveData(
+                $"setup_save_data_memory2 user={setup.UserId} slot={setup.SlotId} " +
+                $"memory_size=0x{setup.MemorySize:X} icon_memory_size=0x{setup.IconMemorySize:X} " +
+                $"option=0x{setup.Option:X} existed=0x{existedSize:X} path='{memoryPath}'");
+            return ctx.SetReturn(0);
+        }
+        catch (IOException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorInternal);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorInternal);
+        }
+        catch (ArgumentException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+    }
+
+    private static bool TryReadMemorySetup2(CpuContext ctx, ulong address, out MemorySetup2 setup)
+    {
+        setup = default;
+        Span<byte> buffer = stackalloc byte[SaveDataMemorySetup2Size];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            return false;
+        }
+
+        setup = new MemorySetup2(
+            Option: BinaryPrimitives.ReadUInt32LittleEndian(buffer[0x00..]),
+            UserId: BinaryPrimitives.ReadInt32LittleEndian(buffer[0x04..]),
+            MemorySize: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x08..]),
+            IconMemorySize: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x10..]),
+            InitParamAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x18..]),
+            InitIconAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x20..]),
+            SlotId: BinaryPrimitives.ReadUInt32LittleEndian(buffer[0x28..]));
+        return true;
+    }
+
+    private static string ResolveSaveMemoryPath(int userId, uint slotId)
+    {
+        var titleId = ResolveConfiguredTitleId();
+        return Path.Combine(
+            ResolveTitleSaveRoot(userId, titleId),
+            $"slot_{slotId}",
+            "memory.dat");
+    }
+
     private static bool TryReadSearchCond(CpuContext ctx, ulong address, out SearchCond cond)
     {
         cond = default;
@@ -631,4 +744,13 @@ public static class SaveDataExports
         ulong InfosAddress);
 
     private readonly record struct SaveEntry(string Name, string Path, DateTime LastWriteUtc);
+
+    private readonly record struct MemorySetup2(
+        uint Option,
+        int UserId,
+        ulong MemorySize,
+        ulong IconMemorySize,
+        ulong InitParamAddress,
+        ulong InitIconAddress,
+        uint SlotId);
 }
