@@ -298,6 +298,78 @@ internal static class KernelSocketCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(
+        Nid = "9oiX1kyeedA",
+        ExportName = "bzero",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int Bzero(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rdi];
+        var length = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (length > 0 && address != 0)
+        {
+            var zeros = new byte[length];
+            if (!ctx.Memory.TryWrite(address, zeros))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "4n51s0zEf0c",
+        ExportName = "inet_pton",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int InetPton(CpuContext ctx)
+    {
+        var af = unchecked((int)ctx[CpuRegister.Rdi]);
+        var srcAddress = ctx[CpuRegister.Rsi];
+        var dstAddress = ctx[CpuRegister.Rdx];
+        if (af != 2 || srcAddress == 0 || dstAddress == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)0xFFFFFFFFFFFFFFFF);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryReadCString(srcAddress, ctx, out var text) ||
+            !TryParseIpv4Address(text, out var octets))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        Span<byte> packed = stackalloc byte[4];
+        packed[0] = octets[0];
+        packed[1] = octets[1];
+        packed[2] = octets[2];
+        packed[3] = octets[3];
+        if (!ctx.Memory.TryWrite(dstAddress, packed))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 1;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "jogUIsOV3-U",
+        ExportName = "htons",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int Htons(CpuContext ctx)
+    {
+        var value = unchecked((ushort)ctx[CpuRegister.Rdi]);
+        var swapped = (ushort)(((value & 0x00FF) << 8) | ((value >> 8) & 0x00FF));
+        ctx[CpuRegister.Rax] = swapped;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static bool TryGetEmulatedSocketState(int fd, out EmulatedSocketState? state)
     {
         lock (Gate)
@@ -437,5 +509,50 @@ internal static class KernelSocketCompatExports
             client = null!;
             return false;
         }
+    }
+
+    private static bool TryReadCString(ulong address, CpuContext ctx, out string text)
+    {
+        const int maxLength = 64;
+        var buffer = new byte[maxLength];
+        var length = 0;
+        for (; length < maxLength; length++)
+        {
+            if (!ctx.Memory.TryRead(address + (ulong)length, buffer.AsSpan(length, 1)))
+            {
+                text = string.Empty;
+                return false;
+            }
+
+            if (buffer[length] == 0)
+            {
+                break;
+            }
+        }
+
+        text = Encoding.ASCII.GetString(buffer, 0, length);
+        return true;
+    }
+
+    private static bool TryParseIpv4Address(string text, out byte[] octets)
+    {
+        octets = Array.Empty<byte>();
+        var parts = text.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length != 4)
+        {
+            return false;
+        }
+
+        var parsed = new byte[4];
+        for (var i = 0; i < 4; i++)
+        {
+            if (!byte.TryParse(parts[i], out parsed[i]))
+            {
+                return false;
+            }
+        }
+
+        octets = parsed;
+        return true;
     }
 }
