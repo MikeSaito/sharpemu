@@ -56,6 +56,8 @@ public static class FontExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        FontGuestState.RecordMemoryInit(regionAddress, regionSize);
+
         TraceFont(
             $"memory_init mem_desc=0x{memDescAddress:X16} region=0x{regionAddress:X16} " +
             $"region_size=0x{regionSize:X} iface=0x{ifaceAddress:X16} mspace=0x{mspaceAddress:X16}");
