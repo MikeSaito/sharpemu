@@ -112,6 +112,32 @@ internal static class FontGuestState
         }
     }
 
+    internal static bool TryBumpAllocateZeroed(CpuContext ctx, ulong size, ulong alignment, out ulong address)
+    {
+        address = 0;
+        if (!TryBumpAllocate(size, alignment, out address))
+        {
+            return false;
+        }
+
+        const int chunkSize = 0x1000;
+        Span<byte> zeroes = stackalloc byte[chunkSize];
+        zeroes.Clear();
+        for (ulong offset = 0; offset < size;)
+        {
+            var writeSize = (int)Math.Min((ulong)chunkSize, size - offset);
+            if (!ctx.Memory.TryWrite(address + offset, zeroes[..writeSize]))
+            {
+                address = 0;
+                return false;
+            }
+
+            offset += (ulong)writeSize;
+        }
+
+        return true;
+    }
+
     private static ulong AlignUp(ulong value, ulong alignment)
     {
         if (alignment <= 1)
