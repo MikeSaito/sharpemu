@@ -120,6 +120,29 @@ internal static class FontGuestState
             return false;
         }
 
+        return TryZeroGuestMemory(ctx, address, size);
+    }
+
+    internal static bool TryAllocateFontBuffer(CpuContext ctx, ulong size, ulong alignment, out ulong address)
+    {
+        if (TryBumpAllocateZeroed(ctx, size, alignment, out address))
+        {
+            return true;
+        }
+
+        address = 0;
+        if (!KernelMemoryCompatExports.TryAllocateHleData(ctx, size, Math.Max(alignment, 0x10UL), out address) ||
+            address == 0)
+        {
+            address = 0;
+            return false;
+        }
+
+        return TryZeroGuestMemory(ctx, address, size);
+    }
+
+    private static bool TryZeroGuestMemory(CpuContext ctx, ulong address, ulong size)
+    {
         const int chunkSize = 0x1000;
         Span<byte> zeroes = stackalloc byte[chunkSize];
         zeroes.Clear();
@@ -128,7 +151,6 @@ internal static class FontGuestState
             var writeSize = (int)Math.Min((ulong)chunkSize, size - offset);
             if (!ctx.Memory.TryWrite(address + offset, zeroes[..writeSize]))
             {
-                address = 0;
                 return false;
             }
 
