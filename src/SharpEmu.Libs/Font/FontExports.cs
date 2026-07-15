@@ -130,6 +130,44 @@ public static class FontExports
         return ctx.SetReturn(0);
     }
 
+    [SysAbiExport(
+        Nid = "SsRbbCiWoGw",
+        ExportName = "sceFontSupportSystemFonts",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSupportSystemFonts(CpuContext ctx)
+    {
+        var libraryAddress = ctx[CpuRegister.Rdi];
+        if (libraryAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        TraceFont($"support_system_fonts library=0x{libraryAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "mz2iTY0MK4A",
+        ExportName = "sceFontSupportExternalFonts",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSupportExternalFonts(CpuContext ctx)
+    {
+        var libraryAddress = ctx[CpuRegister.Rdi];
+        var fontMax = ctx[CpuRegister.Rsi];
+        var formats = ctx[CpuRegister.Rdx];
+        if (libraryAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        TraceFont(
+            $"support_external_fonts library=0x{libraryAddress:X16} " +
+            $"font_max=0x{fontMax:X} formats=0x{formats:X}");
+        return ctx.SetReturn(0);
+    }
+
     private static bool TryReadMemoryDescriptor(CpuContext ctx, ulong address, out FontMemoryDescriptor memory)
     {
         memory = default;
