@@ -1002,6 +1002,14 @@ public static class AgcExports
         DcbWriteData(ctx);
 
     [SysAbiExport(
+        Nid = "-RnpfpxIhec",
+        ExportName = "sceAgcAcbDmaData",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbDmaData(CpuContext ctx) =>
+        DcbDmaData(ctx);
+
+    [SysAbiExport(
         Nid = "cpCILPya5Zk",
         ExportName = "sceAgcAcbPushMarker",
         Target = Generation.Gen5,
