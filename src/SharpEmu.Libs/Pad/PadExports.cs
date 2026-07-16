@@ -97,6 +97,31 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "vDLMoJLde8I",
+        ExportName = "scePadSetTiltCorrectionState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadSetTiltCorrectionState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var enabled = unchecked((int)ctx[CpuRegister.Rsi]);
+        var reserved = ctx[CpuRegister.Rdx];
+        if (!_initialized)
+        {
+            return ctx.SetReturn(OrbisPadErrorNotInitialized);
+        }
+
+        if (handle != PrimaryPadHandle)
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        TracePad(
+            $"set_tilt_correction_state handle=0x{handle:X} enabled=0x{enabled:X} reserved=0x{reserved:X}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "gjP9-KQzoUk",
         ExportName = "scePadGetControllerInformation",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -458,5 +483,13 @@ public static class PadExports
     {
         const int Deadzone = 10;
         return Math.Abs(controller - 128) > Deadzone ? controller : keyboard;
+    }
+
+    private static void TracePad(string message)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD"), "1", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] pad.{message}");
+        }
     }
 }
