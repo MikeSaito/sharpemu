@@ -3515,6 +3515,20 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            // SRD can advertise a larger extent than the last published RT (e.g. 4K
+            // fmt71 over a 1080p R8G8 image). Prefer sampling the published GPU image
+            // (clamped extent) over a zero guest-RAM upload.
+            if (texture.Address != 0 &&
+                _guestImages.TryGetValue(texture.Address, out var publishedImage) &&
+                TryCreateOversizedAliasTextureResource(
+                    texture,
+                    publishedImage,
+                    vkFormat,
+                    out var oversizedAlias))
+            {
+                return oversizedAlias;
+            }
+
             return CreateTextureResource(texture);
         }
 
@@ -3595,6 +3609,58 @@ internal static unsafe class VulkanVideoPresenter
                 SamplerState = texture.Sampler,
                 AliasSourceImage = guestImage,
                 NeedsGpuConvert = true,
+            };
+            return true;
+        }
+
+        private bool TryCreateOversizedAliasTextureResource(
+            VulkanGuestDrawTexture texture,
+            GuestImageResource guestImage,
+            Format requestedFormat,
+            out TextureResource resource)
+        {
+            resource = default!;
+            if (!guestImage.Initialized ||
+                guestImage.IsCpuBacked ||
+                texture.Width == 0 ||
+                texture.Height == 0 ||
+                (texture.Width <= guestImage.Width && texture.Height <= guestImage.Height))
+            {
+                return false;
+            }
+
+            // Bind the published image at its real extent. Normalized UVs still cover
+            // the content; avoid zero CPU uploads and avoid blit format conversion.
+            var viewFormat = IsCompatibleViewFormat(guestImage.Format, requestedFormat)
+                ? requestedFormat
+                : guestImage.Format;
+            if (!TryGetOrCreateGuestImageView(
+                    guestImage,
+                    viewFormat,
+                    mipLevel: 0,
+                    levelCount: guestImage.MipLevels,
+                    dstSelect: texture.DstSelect,
+                    out var view))
+            {
+                return false;
+            }
+
+            TraceVulkanShader(
+                $"vk.texture_oversized_alias addr=0x{texture.Address:X16} " +
+                $"texture={texture.Width}x{texture.Height} requested={requestedFormat} " +
+                $"image={guestImage.Width}x{guestImage.Height} source={guestImage.Format} " +
+                $"view={viewFormat}");
+            resource = new TextureResource
+            {
+                Address = texture.Address,
+                Image = guestImage.Image,
+                View = view,
+                Width = guestImage.Width,
+                Height = guestImage.Height,
+                RowLength = guestImage.Width,
+                DstSelect = texture.DstSelect,
+                SamplerState = texture.Sampler,
+                GuestImage = guestImage,
             };
             return true;
         }
@@ -3694,6 +3760,24 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+            // A published RT can sit at this address with a smaller extent / different
+            // format (e.g. 1080p R8G8). Recreating it as a larger storage image drops
+            // live content and can lose the device while draws still sample it. Keep
+            // the published image and give compute a scratch target instead.
+            if (_guestImages.TryGetValue(texture.Address, out var published) &&
+                published.Initialized &&
+                !published.IsCpuBacked &&
+                (published.Width != texture.Width ||
+                 published.Height != texture.Height ||
+                 published.Format != vkFormat))
+            {
+                TraceVulkanShader(
+                    $"vk.storage_keep_published addr=0x{texture.Address:X16} " +
+                    $"published={published.Width}x{published.Height}:{published.Format} " +
+                    $"storage={texture.Width}x{texture.Height}:{vkFormat}");
+                return CreateStorageScratchResource(texture);
+            }
+
             var guestImage = ResolveStorageGuestImage(texture);
             var view = GetOrCreateGuestImageView(
                 guestImage,
@@ -5309,6 +5393,20 @@ internal static unsafe class VulkanVideoPresenter
                     return existing;
                 }
 
+                // Pending guest draws may still sample this image. Drain them before
+                // destroying so a later storage recreate (e.g. 4K fmt71 over 1080p R8G8)
+                // does not lose the device.
+                CollectCompletedGuestSubmissions(waitForOldest: true);
+                while (_pendingGuestSubmissions.Count > 0)
+                {
+                    CollectCompletedGuestSubmissions(waitForOldest: true);
+                }
+
+                Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(guest image replace)");
+                TraceVulkanShader(
+                    $"vk.guest_image_replace addr=0x{target.Address:X16} " +
+                    $"from={existing.Width}x{existing.Height}:{existing.Format} " +
+                    $"to={target.Width}x{target.Height}:{format}");
                 DestroyGuestImage(existing);
                 _guestImages.Remove(target.Address);
                 lock (_gate)
