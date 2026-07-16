@@ -160,6 +160,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedDcbSizes = new();
     private static readonly HashSet<(ulong Es, ulong Ps, GuestDrawKind Kind)> _tracedShaderTranslations = new();
     private static readonly HashSet<(ulong Es, ulong Ps)> _tracedShaderDecodePairs = new();
+    private static readonly HashSet<(ulong Es, ulong Ps)> _tracedShaderDrawSoftSkips = new();
     private static readonly HashSet<(ulong Es, ulong Ps, ulong Target, ulong Texture, uint VertexCount)> _tracedShaderDraws = new();
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
@@ -3555,7 +3556,30 @@ public static class AgcExports
         {
             state.TranslatedDraw = translatedDraw;
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
-            if (firstTarget.Address != 0)
+            var crashPronePair = VulkanVideoPresenter.IsCrashProneGuestShaderPair(
+                exportShaderAddress,
+                pixelShaderAddress);
+            if (crashPronePair)
+            {
+                VulkanVideoPresenter.BanTranslatedGraphicsSpirv(
+                    translatedDraw.VertexSpirv,
+                    translatedDraw.PixelSpirv,
+                    $"guest-es-ps es=0x{exportShaderAddress:X16} ps=0x{pixelShaderAddress:X16}");
+                var softSkipKey = (exportShaderAddress, pixelShaderAddress);
+                var shouldTraceSoftSkip = false;
+                lock (_submitTraceGate)
+                {
+                    shouldTraceSoftSkip = _tracedShaderDrawSoftSkips.Add(softSkipKey);
+                }
+
+                if (shouldTraceSoftSkip)
+                {
+                    TraceAgcShader(
+                        $"agc.shader_draw_soft_skip es=0x{exportShaderAddress:X16} " +
+                        $"ps=0x{pixelShaderAddress:X16} reason=nvgpucomp-crash-prone");
+                }
+            }
+            else if (firstTarget.Address != 0)
             {
                 var textures = CreateVulkanGuestDrawTextures(
                     ctx,

@@ -168,6 +168,13 @@ internal static unsafe class VulkanVideoPresenter
     private const uint GuestFormatR16G16B16A16Sint = 0x2000C;
 
     private static readonly object _gate = new();
+    private static readonly object _pipelineBanGate = new();
+    private static readonly HashSet<string> _bannedTranslatedGraphicsSpirvPairs = new(StringComparer.Ordinal);
+    private static readonly HashSet<(ulong Es, ulong Ps)> _crashProneGuestShaderPairs =
+    [
+        // Astro Bot: nvgpucomp64 AV (null@+0x10) during CreateGraphicsPipelines for this ES/PS pair.
+        (0x0000000808E88D00UL, 0x0000000808E88000UL),
+    ];
     private static readonly Queue<object> _pendingGuestWork = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     private static readonly Dictionary<ulong, uint> _gpuGuestImages = new();
@@ -191,6 +198,51 @@ internal static unsafe class VulkanVideoPresenter
         return string.Equals(mode, "1", StringComparison.Ordinal) ||
                string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase);
     }
+
+    public static bool IsCrashProneGuestShaderPair(ulong exportShaderAddress, ulong pixelShaderAddress)
+    {
+        lock (_pipelineBanGate)
+        {
+            return _crashProneGuestShaderPairs.Contains((exportShaderAddress, pixelShaderAddress));
+        }
+    }
+
+    public static void BanTranslatedGraphicsSpirv(
+        byte[] vertexSpirv,
+        byte[] fragmentSpirv,
+        string reason)
+    {
+        var key = MakeTranslatedGraphicsSpirvPairKey(vertexSpirv, fragmentSpirv);
+        lock (_pipelineBanGate)
+        {
+            if (!_bannedTranslatedGraphicsSpirvPairs.Add(key))
+            {
+                return;
+            }
+        }
+
+        var vsDigest = key[..key.IndexOf(':')];
+        var psDigest = key[(key.IndexOf(':') + 1)..];
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] vk.pipeline_ban " +
+            $"vs={vsDigest[..Math.Min(12, vsDigest.Length)]} " +
+            $"ps={psDigest[..Math.Min(12, psDigest.Length)]} " +
+            $"reason={reason}");
+    }
+
+    public static bool IsTranslatedGraphicsSpirvBanned(byte[] vertexSpirv, byte[] fragmentSpirv)
+    {
+        var key = MakeTranslatedGraphicsSpirvPairKey(vertexSpirv, fragmentSpirv);
+        lock (_pipelineBanGate)
+        {
+            return _bannedTranslatedGraphicsSpirvPairs.Contains(key);
+        }
+    }
+
+    private static string MakeTranslatedGraphicsSpirvPairKey(byte[] vertexSpirv, byte[] fragmentSpirv) =>
+        Convert.ToHexString(SHA256.HashData(vertexSpirv ?? [])) +
+        ":" +
+        Convert.ToHexString(SHA256.HashData(fragmentSpirv ?? []));
 
     public static void EnsureStarted(uint width, uint height)
     {
@@ -399,6 +451,12 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
+        var resolvedVertexSpirv = vertexSpirv ?? [];
+        if (IsTranslatedGraphicsSpirvBanned(resolvedVertexSpirv, pixelSpirv))
+        {
+            return;
+        }
+
         if (ShouldTracePresentedGuestImageContentsForDiagnostics())
         {
             Console.Error.WriteLine(
@@ -420,7 +478,7 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 GuestDrawKind.None,
                 new VulkanTranslatedGuestDraw(
-                    vertexSpirv ?? [],
+                    resolvedVertexSpirv,
                     pixelSpirv,
                     textures.ToArray(),
                     globalMemoryBuffers.ToArray(),
@@ -472,6 +530,12 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
+        var resolvedVertexSpirv = vertexSpirv ?? [];
+        if (IsTranslatedGraphicsSpirvBanned(resolvedVertexSpirv, pixelSpirv))
+        {
+            return;
+        }
+
         if (ShouldTracePresentedGuestImageContentsForDiagnostics())
         {
             Console.Error.WriteLine(
@@ -497,7 +561,7 @@ internal static unsafe class VulkanVideoPresenter
             EnqueueGuestWorkLocked(
                 new VulkanOffscreenGuestDraw(
                     new VulkanTranslatedGuestDraw(
-                        vertexSpirv ?? [],
+                        resolvedVertexSpirv,
                         pixelSpirv,
                         textures.ToArray(),
                         globalMemoryBuffers.ToArray(),
@@ -525,6 +589,11 @@ internal static unsafe class VulkanVideoPresenter
             width == 0 ||
             height == 0 ||
             textures.All(texture => !texture.IsStorage))
+        {
+            return;
+        }
+
+        if (IsTranslatedGraphicsSpirvBanned([], pixelSpirv))
         {
             return;
         }
@@ -1011,6 +1080,8 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Dictionary<byte[], Pipeline> _computePipelines =
             new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<GraphicsPipelineKey, Pipeline> _graphicsPipelines = new();
+        private readonly HashSet<GraphicsPipelineKey> _failedGraphicsPipelines = new();
+        private readonly HashSet<GraphicsPipelineKey> _dumpedFailedGraphicsPipelines = new();
         private readonly Dictionary<VulkanGuestSampler, Sampler> _samplers = new();
         private readonly Dictionary<byte[], string> _shaderDigests =
             new(ReferenceEqualityComparer.Instance);
@@ -2497,13 +2568,19 @@ internal static unsafe class VulkanVideoPresenter
                 CreateTranslatedDescriptorResources(
                     resources,
                     ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit);
-                CreateTranslatedPipeline(
-                    resources,
-                    vertexSpirv,
-                    draw.PixelSpirv,
-                    renderPass,
-                    renderTargetFormat,
-                    extent);
+                if (!TryCreateTranslatedPipeline(
+                        resources,
+                        vertexSpirv,
+                        draw.PixelSpirv,
+                        renderPass,
+                        renderTargetFormat,
+                        extent,
+                        out var pipelineError))
+                {
+                    throw new InvalidOperationException(
+                        $"translated graphics pipeline soft-fail: {pipelineError}");
+                }
+
                 return resources;
             }
             catch
@@ -2794,14 +2871,16 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        private void CreateTranslatedPipeline(
+        private bool TryCreateTranslatedPipeline(
             TranslatedDrawResources resources,
             byte[] vertexSpirv,
             byte[] fragmentSpirv,
             RenderPass renderPass,
             Format renderTargetFormat,
-            Extent2D extent)
+            Extent2D extent,
+            out string error)
         {
+            error = string.Empty;
             var pipelineKey = new GraphicsPipelineKey(
                 GetShaderDigest(vertexSpirv),
                 GetShaderDigest(fragmentSpirv),
@@ -2814,14 +2893,50 @@ internal static unsafe class VulkanVideoPresenter
             {
                 resources.Pipeline = cachedPipeline;
                 resources.PipelineCached = true;
-                return;
+                return true;
             }
 
-            var vertexModule = CreateShaderModule(vertexSpirv);
-            var fragmentModule = CreateShaderModule(fragmentSpirv);
-            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            if (_failedGraphicsPipelines.Contains(pipelineKey))
+            {
+                error = "previously-failed";
+                return false;
+            }
+
+            if (IsTranslatedGraphicsSpirvBanned(vertexSpirv, fragmentSpirv))
+            {
+                error = "banned-spirv-pair";
+                _failedGraphicsPipelines.Add(pipelineKey);
+                return false;
+            }
+
+            if (!TryValidateSpirvBinary(vertexSpirv, "vs", out error) ||
+                !TryValidateSpirvBinary(fragmentSpirv, "ps", out error))
+            {
+                MarkGraphicsPipelineFailed(
+                    pipelineKey,
+                    vertexSpirv,
+                    fragmentSpirv,
+                    error);
+                return false;
+            }
+
+            ShaderModule vertexModule = default;
+            ShaderModule fragmentModule = default;
+            byte* entryPoint = null;
             try
             {
+                if (!TryCreateShaderModule(vertexSpirv, out vertexModule, out error) ||
+                    !TryCreateShaderModule(fragmentSpirv, out fragmentModule, out error))
+                {
+                    MarkGraphicsPipelineFailed(
+                        pipelineKey,
+                        vertexSpirv,
+                        fragmentSpirv,
+                        error);
+                    return false;
+                }
+
+                entryPoint = (byte*)SilkMarshal.StringToPtr("main");
                 var shaderStages = stackalloc PipelineShaderStageCreateInfo[2];
                 shaderStages[0] = new PipelineShaderStageCreateInfo
                 {
@@ -2957,16 +3072,24 @@ internal static unsafe class VulkanVideoPresenter
                         RenderPass = renderPass,
                         Subpass = 0,
                     };
-                    Pipeline pipeline;
-                    Check(
-                        _vk.CreateGraphicsPipelines(
-                            _device,
-                            _pipelineCache,
-                            1,
-                            &pipelineInfo,
-                            null,
-                            out pipeline),
-                        "vkCreateGraphicsPipelines(translated)");
+                    var createResult = _vk.CreateGraphicsPipelines(
+                        _device,
+                        _pipelineCache,
+                        1,
+                        &pipelineInfo,
+                        null,
+                        out var pipeline);
+                    if (createResult != Result.Success || pipeline.Handle == 0)
+                    {
+                        error = $"vkCreateGraphicsPipelines={createResult}";
+                        MarkGraphicsPipelineFailed(
+                            pipelineKey,
+                            vertexSpirv,
+                            fragmentSpirv,
+                            error);
+                        return false;
+                    }
+
                     resources.Pipeline = pipeline;
                     resources.PipelineCached = true;
                     _graphicsPipelines.Add(pipelineKey, pipeline);
@@ -2974,13 +3097,148 @@ internal static unsafe class VulkanVideoPresenter
                         ObjectType.Pipeline,
                         pipeline.Handle,
                         $"SharpEmu graphics ps={fragmentSpirv.Length}b attrs={resources.Textures.Length}");
+                    return true;
                 }
+            }
+            catch (Exception exception)
+            {
+                if (exception.Message.Contains(
+                        nameof(Result.ErrorDeviceLost),
+                        StringComparison.Ordinal))
+                {
+                    throw;
+                }
+
+                error = exception.GetType().Name + ": " + exception.Message;
+                MarkGraphicsPipelineFailed(
+                    pipelineKey,
+                    vertexSpirv,
+                    fragmentSpirv,
+                    error);
+                return false;
             }
             finally
             {
-                SilkMarshal.Free((nint)entryPoint);
-                _vk.DestroyShaderModule(_device, fragmentModule, null);
-                _vk.DestroyShaderModule(_device, vertexModule, null);
+                if (entryPoint is not null)
+                {
+                    SilkMarshal.Free((nint)entryPoint);
+                }
+
+                if (fragmentModule.Handle != 0)
+                {
+                    _vk.DestroyShaderModule(_device, fragmentModule, null);
+                }
+
+                if (vertexModule.Handle != 0)
+                {
+                    _vk.DestroyShaderModule(_device, vertexModule, null);
+                }
+            }
+        }
+
+        private bool TryCreateShaderModule(
+            byte[] code,
+            out ShaderModule module,
+            out string error)
+        {
+            module = default;
+            error = string.Empty;
+            fixed (byte* codePointer = code)
+            {
+                var createInfo = new ShaderModuleCreateInfo
+                {
+                    SType = StructureType.ShaderModuleCreateInfo,
+                    CodeSize = (nuint)code.Length,
+                    PCode = (uint*)codePointer,
+                };
+                var result = _vk.CreateShaderModule(
+                    _device,
+                    &createInfo,
+                    null,
+                    out module);
+                if (result == Result.Success && module.Handle != 0)
+                {
+                    return true;
+                }
+
+                error = $"vkCreateShaderModule={result}";
+                module = default;
+                return false;
+            }
+        }
+
+        private static bool TryValidateSpirvBinary(
+            byte[] spirv,
+            string stage,
+            out string error)
+        {
+            error = string.Empty;
+            if (spirv.Length < 20)
+            {
+                error = $"{stage}-too-small bytes={spirv.Length}";
+                return false;
+            }
+
+            if ((spirv.Length & 3) != 0)
+            {
+                error = $"{stage}-unaligned bytes={spirv.Length}";
+                return false;
+            }
+
+            var magic = BitConverter.ToUInt32(spirv, 0);
+            if (magic != 0x07230203u)
+            {
+                error = $"{stage}-bad-magic=0x{magic:X8}";
+                return false;
+            }
+
+            // Bound id count must be non-zero for a usable module.
+            var bound = BitConverter.ToUInt32(spirv, 12);
+            if (bound == 0 || bound > 1_000_000)
+            {
+                error = $"{stage}-bad-bound={bound}";
+                return false;
+            }
+
+            return true;
+        }
+
+        private void MarkGraphicsPipelineFailed(
+            GraphicsPipelineKey pipelineKey,
+            byte[] vertexSpirv,
+            byte[] fragmentSpirv,
+            string reason)
+        {
+            _failedGraphicsPipelines.Add(pipelineKey);
+            BanTranslatedGraphicsSpirv(vertexSpirv, fragmentSpirv, reason);
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] vk.pipeline_soft_fail " +
+                $"vs={pipelineKey.VertexShader[..Math.Min(12, pipelineKey.VertexShader.Length)]} " +
+                $"ps={pipelineKey.FragmentShader[..Math.Min(12, pipelineKey.FragmentShader.Length)]} " +
+                $"fmt={pipelineKey.RenderTargetFormat} reason={reason}");
+
+            if (!_dumpedFailedGraphicsPipelines.Add(pipelineKey))
+            {
+                return;
+            }
+
+            try
+            {
+                var directory = Path.Combine(AppContext.BaseDirectory, "shader-dumps");
+                Directory.CreateDirectory(directory);
+                var stem =
+                    $"{pipelineKey.VertexShader[..Math.Min(16, pipelineKey.VertexShader.Length)]}-" +
+                    $"{pipelineKey.FragmentShader[..Math.Min(16, pipelineKey.FragmentShader.Length)]}";
+                File.WriteAllBytes(Path.Combine(directory, $"{stem}.vs.spv"), vertexSpirv);
+                File.WriteAllBytes(Path.Combine(directory, $"{stem}.ps.spv"), fragmentSpirv);
+                File.WriteAllText(
+                    Path.Combine(directory, $"{stem}.fail.txt"),
+                    reason + Environment.NewLine);
+            }
+            catch (Exception dumpException)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] vk.pipeline_soft_fail dump failed: {dumpException.Message}");
             }
         }
 
@@ -4877,7 +5135,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 Console.Error.WriteLine(
-                    $"[LOADER][ERROR] Vulkan offscreen draw failed " +
+                    $"[LOADER][WARN] Vulkan offscreen draw skipped " +
                     $"addr=0x{work.Target.Address:X16}: {exception.Message}");
             }
             finally
@@ -5654,7 +5912,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _presentedSequence = presentation.Sequence;
                     Console.Error.WriteLine(
-                        $"[LOADER][ERROR] Vulkan VideoOut translated draw setup failed: {exception.Message}");
+                        $"[LOADER][WARN] Vulkan VideoOut translated draw setup skipped: {exception.Message}");
                     return;
                 }
             }
@@ -7051,6 +7309,8 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyPipeline(_device, pipeline, null);
             }
             _graphicsPipelines.Clear();
+            _failedGraphicsPipelines.Clear();
+            _dumpedFailedGraphicsPipelines.Clear();
             if (_pipelineCache.Handle != 0)
             {
                 _vk.DestroyPipelineCache(_device, _pipelineCache, null);
