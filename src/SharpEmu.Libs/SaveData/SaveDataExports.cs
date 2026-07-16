@@ -33,6 +33,7 @@ public static class SaveDataExports
     private const int SaveDataMemorySetupResultSize = 0x18;
     private const int SaveDataMemoryGet2Size = 0x40;
     private const int SaveDataMemoryDataSize = 0x40;
+    private const int SaveDataMemorySet2Size = 0x48;
     private static readonly object _stateGate = new();
     private static readonly HashSet<int> _transactionResources = [];
     private static readonly HashSet<int> _preparedTransactionResources = [];
@@ -547,6 +548,96 @@ public static class SaveDataExports
         }
     }
 
+    [SysAbiExport(
+        Nid = "cduy9v4YmT4",
+        ExportName = "sceSaveDataSetSaveDataMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetSaveDataMemory2(CpuContext ctx)
+    {
+        var setParamAddress = ctx[CpuRegister.Rdi];
+        if (setParamAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        lock (_stateGate)
+        {
+            if (!_initialized)
+            {
+                return ctx.SetReturn(OrbisSaveDataErrorInternal);
+            }
+        }
+
+        if (!TryReadMemorySet2(ctx, setParamAddress, out var set))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (set.UserId < 0)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+
+        try
+        {
+            var memoryPath = ResolveSaveMemoryPath(set.UserId, set.SlotId);
+            if (!File.Exists(memoryPath))
+            {
+                return ctx.SetReturn(OrbisSaveDataErrorNotFound);
+            }
+
+            var bytesWritten = 0L;
+            if (set.DataAddress != 0)
+            {
+                var dataNum = set.DataNum == 0 ? 1u : set.DataNum;
+                for (uint index = 0; index < dataNum; index++)
+                {
+                    var entryAddress = set.DataAddress + (ulong)index * (ulong)SaveDataMemoryDataSize;
+                    if (!TryReadMemoryData(ctx, entryAddress, out var data))
+                    {
+                        return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                    }
+
+                    if (data.BufferAddress == 0 || data.BufferSize == 0)
+                    {
+                        continue;
+                    }
+
+                    bytesWritten += TryWriteMemoryFile(
+                        ctx,
+                        memoryPath,
+                        data.BufferAddress,
+                        data.BufferSize,
+                        data.Offset,
+                        out var writeError);
+                    if (writeError != 0)
+                    {
+                        return ctx.SetReturn(writeError);
+                    }
+                }
+            }
+
+            TraceSaveData(
+                $"set_save_data_memory2 user={set.UserId} slot={set.SlotId} data_num={set.DataNum} " +
+                $"data=0x{set.DataAddress:X16} param=0x{set.ParamAddress:X16} icon=0x{set.IconAddress:X16} " +
+                $"written=0x{bytesWritten:X} path='{memoryPath}'");
+            return ctx.SetReturn(0);
+        }
+        catch (IOException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorInternal);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorInternal);
+        }
+        catch (ArgumentException)
+        {
+            return ctx.SetReturn(OrbisSaveDataErrorParameter);
+        }
+    }
+
     private static bool TryReadMemorySetup2(CpuContext ctx, ulong address, out MemorySetup2 setup)
     {
         setup = default;
@@ -582,6 +673,25 @@ public static class SaveDataExports
             ParamAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x10..]),
             IconAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x18..]),
             SlotId: BinaryPrimitives.ReadUInt32LittleEndian(buffer[0x20..]));
+        return true;
+    }
+
+    private static bool TryReadMemorySet2(CpuContext ctx, ulong address, out MemorySet2 set)
+    {
+        set = default;
+        Span<byte> buffer = stackalloc byte[SaveDataMemorySet2Size];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            return false;
+        }
+
+        set = new MemorySet2(
+            UserId: BinaryPrimitives.ReadInt32LittleEndian(buffer[0x00..]),
+            DataAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x08..]),
+            ParamAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x10..]),
+            IconAddress: BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x18..]),
+            DataNum: BinaryPrimitives.ReadUInt32LittleEndian(buffer[0x20..]),
+            SlotId: BinaryPrimitives.ReadUInt32LittleEndian(buffer[0x24..]));
         return true;
     }
 
@@ -659,6 +769,51 @@ public static class SaveDataExports
         }
 
         return read;
+    }
+
+    private static long TryWriteMemoryFile(
+        CpuContext ctx,
+        string memoryPath,
+        ulong bufferAddress,
+        ulong bufferSize,
+        long offset,
+        out int error)
+    {
+        error = 0;
+        if (offset < 0)
+        {
+            error = OrbisSaveDataErrorParameter;
+            return 0;
+        }
+
+        if (bufferAddress == 0 || bufferSize == 0)
+        {
+            return 0;
+        }
+
+        var toWrite = (int)Math.Min(bufferSize, int.MaxValue);
+        var guestData = new byte[toWrite];
+        if (!ctx.Memory.TryRead(bufferAddress, guestData))
+        {
+            error = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            return 0;
+        }
+
+        using var stream = new FileStream(memoryPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        if (offset > stream.Length)
+        {
+            stream.SetLength(offset);
+        }
+
+        stream.Seek(offset, SeekOrigin.Begin);
+        stream.Write(guestData, 0, toWrite);
+        var endPosition = offset + toWrite;
+        if (stream.Length < endPosition)
+        {
+            stream.SetLength(endPosition);
+        }
+
+        return toWrite;
     }
 
     private static string ResolveSaveMemoryPath(int userId, uint slotId)
@@ -938,6 +1093,14 @@ public static class SaveDataExports
         ulong DataAddress,
         ulong ParamAddress,
         ulong IconAddress,
+        uint SlotId);
+
+    private readonly record struct MemorySet2(
+        int UserId,
+        ulong DataAddress,
+        ulong ParamAddress,
+        ulong IconAddress,
+        uint DataNum,
         uint SlotId);
 
     private readonly record struct MemoryData(
