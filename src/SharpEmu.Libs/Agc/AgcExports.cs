@@ -1002,6 +1002,22 @@ public static class AgcExports
         DcbWriteData(ctx);
 
     [SysAbiExport(
+        Nid = "cpCILPya5Zk",
+        ExportName = "sceAgcAcbPushMarker",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbPushMarker(CpuContext ctx) =>
+        DcbPushMarker(ctx);
+
+    [SysAbiExport(
+        Nid = "6mFxkVqdmbQ",
+        ExportName = "sceAgcAcbPopMarker",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbPopMarker(CpuContext ctx) =>
+        DcbPopMarker(ctx);
+
+    [SysAbiExport(
         Nid = "j3EtxFkSIhQ",
         ExportName = "sceAgcAcbDispatchIndirect",
         Target = Generation.Gen5,
@@ -1202,6 +1218,31 @@ public static class AgcExports
         }
 
         TraceAgc($"agc.dcb_set_index_size buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} size={indexSize}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "8N2tmT3jmC8",
+        ExportName = "sceAgcDcbSetIndexCount",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetIndexCount(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var indexCount = (uint)ctx[CpuRegister.Rsi];
+        if (commandBufferAddress == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
+            !ctx.TryWriteUInt32(commandAddress, Pm4(2, ItIndexBufferSize, 0)) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, indexCount))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_set_index_count buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} count={indexCount}");
         return ReturnPointer(ctx, commandAddress);
     }
 
@@ -1767,6 +1808,27 @@ public static class AgcExports
         }
 
         return ctx.TryWriteUInt64(commandAddress + 16, destinationAddress)
+            ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "fPSCdQxgpSw",
+        ExportName = "sceAgcWriteDataPatchSetAddressOrOffset",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int WriteDataPatchSetAddressOrOffset(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var destinationAddress = ctx[CpuRegister.Rsi];
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register) ||
+            !(op == ItWriteData || (op == ItNop && register == RWriteData)))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // DcbWriteData / ApplySubmittedWriteData store the destination at +8.
+        return ctx.TryWriteUInt64(commandAddress + 8, destinationAddress)
             ? ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK)
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
