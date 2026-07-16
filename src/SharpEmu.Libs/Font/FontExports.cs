@@ -16,6 +16,7 @@ public static class FontExports
     private const int OrbisFontMemSize = 0x40;
     private const int FontLibraryBlockSize = 0x100;
     private const int FontLibraryMspaceSize = 0x4000;
+    private const int FontRendererBlockSize = 0x80;
     private const int FontLibraryTailOffset = 0xB8;
     private const int FontLibraryDeviceCacheOffset = 0xB0;
     private const int FontLibraryFlagsOffset = 0x08;
@@ -23,6 +24,7 @@ public static class FontExports
     private const int DeviceCacheMinSize = 0x1020;
     private const ushort OrbisFontMemKindInitialized = 0x0F00;
     private const ushort OrbisFontLibraryMagic = 0x0F01;
+    private const ushort OrbisFontRendererMagic = 0x0F02;
     private const uint OrbisFontLibraryFlags = 0x60000000;
     private const uint OrbisFontDeviceCacheOwnedFlag = 1u;
     private const ulong OrbisFontDeviceCacheHeaderMarker = 0x0FF800001000UL;
@@ -135,6 +137,47 @@ public static class FontExports
         TraceFont(
             $"create_library_with_edition memory=0x{memoryAddress:X16} driver=0x{driverTableAddress:X16} " +
             $"edition=0x{edition:X16} library=0x{libraryAddress:X16} mspace=0x{mspaceAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "WaSFJoRWXaI",
+        ExportName = "sceFontCreateRendererWithEdition",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontCreateRendererWithEdition(CpuContext ctx)
+    {
+        var libraryAddress = ctx[CpuRegister.Rdi];
+        var driverTableAddress = ctx[CpuRegister.Rsi];
+        var edition = ctx[CpuRegister.Rdx];
+        var rendererOutAddress = ctx[CpuRegister.Rcx];
+        var arg4 = ctx[CpuRegister.R8];
+        var arg5 = ctx[CpuRegister.R9];
+        if (rendererOutAddress != 0)
+        {
+            _ = ctx.TryWriteUInt64(rendererOutAddress, 0);
+        }
+
+        if (libraryAddress == 0 || driverTableAddress == 0 || rendererOutAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        if (!FontGuestState.TryAllocateFontBuffer(ctx, FontRendererBlockSize, 0x10, out var rendererAddress))
+        {
+            return ctx.SetReturn(OrbisFontErrorAllocationFailed);
+        }
+
+        if (!TryWriteFontRenderer(ctx, rendererAddress, libraryAddress, driverTableAddress, edition, arg4, arg5) ||
+            !ctx.TryWriteUInt64(rendererOutAddress, rendererAddress))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"create_renderer_with_edition library=0x{libraryAddress:X16} driver=0x{driverTableAddress:X16} " +
+            $"edition=0x{edition:X16} out=0x{rendererOutAddress:X16} renderer=0x{rendererAddress:X16} " +
+            $"arg4=0x{arg4:X16} arg5=0x{arg5:X16}");
         return ctx.SetReturn(0);
     }
 
@@ -259,6 +302,27 @@ public static class FontExports
         BinaryPrimitives.WriteUInt32LittleEndian(header[0x0C..], pageCount);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], OrbisFontDeviceCacheHeaderMarker);
         return ctx.Memory.TryWrite(bufferAddress, header);
+    }
+
+    private static bool TryWriteFontRenderer(
+        CpuContext ctx,
+        ulong rendererAddress,
+        ulong libraryAddress,
+        ulong driverTableAddress,
+        ulong edition,
+        ulong arg4,
+        ulong arg5)
+    {
+        Span<byte> renderer = stackalloc byte[FontRendererBlockSize];
+        renderer.Clear();
+        BinaryPrimitives.WriteUInt16LittleEndian(renderer, OrbisFontRendererMagic);
+        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x08..], libraryAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x10..], driverTableAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x18..], edition);
+        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x20..], arg4);
+        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x28..], arg5);
+        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x30..], rendererAddress);
+        return ctx.Memory.TryWrite(rendererAddress, renderer);
     }
 
     private static bool TryReadMemoryDescriptor(CpuContext ctx, ulong address, out FontMemoryDescriptor memory)
