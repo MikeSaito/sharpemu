@@ -371,42 +371,30 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (!TryCopyRegisters(
-                    scalarRegisters,
-                    image.ScalarResource,
-                    ImageDescriptorDwords,
-                    out var resourceDescriptor))
-            {
-                error = $"resource-register-range pc=0x{instruction.Pc:X} s{image.ScalarResource}";
-                return false;
-            }
-
-            IReadOnlyList<uint> samplerDescriptor = [];
-            if (UsesSampler(instruction.Opcode) &&
-                !TryCopyRegisters(
-                    scalarRegisters,
-                    image.ScalarSampler,
-                    SamplerDescriptorDwords,
-                    out samplerDescriptor))
-            {
-                error = $"sampler-register-range pc=0x{instruction.Pc:X} s{image.ScalarSampler}";
-                return false;
-            }
-
-            resolved.Add(new Gen5ImageBinding(
-                instruction.Pc,
-                instruction.Opcode,
-                image,
-                resourceDescriptor,
-                samplerDescriptor,
-                instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
-                TryResolveVectorConstantBefore(
+            if (!TryAddImageBinding(
                     state.Program,
-                    instruction.Pc,
-                    image.GetAddressRegister(2),
-                    out var mipLevel)
-                    ? mipLevel
-                    : null));
+                    instruction,
+                    image,
+                    scalarRegisters,
+                    resolved,
+                    boundPcs: null,
+                    out error))
+            {
+                return false;
+            }
+        }
+
+        // SPIR-V emits every MIMG op, but the walk above follows only one control-flow
+        // path (forward SBranch skips alternate regions). Collect bindings for image
+        // ops that live on skipped paths using a branch-ignoring scalar replay.
+        if (!TryCollectBranchSkippedImageBindings(
+                ctx,
+                state,
+                initialScalarRegisters,
+                resolved,
+                out error))
+        {
+            return false;
         }
 
         evaluation = new Gen5ShaderEvaluation(
@@ -418,6 +406,194 @@ internal static class Gen5ShaderScalarEvaluator
             state.ComputeSystemRegisters,
             runtimeScalarRegisters,
             vertexInputBindings);
+        return true;
+    }
+
+    private static bool TryCollectBranchSkippedImageBindings(
+        CpuContext ctx,
+        Gen5ShaderState state,
+        uint[] initialScalarRegisters,
+        List<Gen5ImageBinding> resolved,
+        out string error)
+    {
+        error = string.Empty;
+        var boundPcs = new HashSet<uint>(resolved.Count);
+        foreach (var binding in resolved)
+        {
+            boundPcs.Add(binding.Pc);
+        }
+
+        var missingImageOps = false;
+        foreach (var instruction in state.Program.Instructions)
+        {
+            if (instruction.Control is Gen5ImageControl &&
+                !boundPcs.Contains(instruction.Pc))
+            {
+                missingImageOps = true;
+                break;
+            }
+        }
+
+        if (!missingImageOps)
+        {
+            return true;
+        }
+
+        var scalarRegisters = (uint[])initialScalarRegisters.Clone();
+        var execMask = RdnaWaveMask;
+        var scalarConditionCode = false;
+        var throwawayBindings = new List<Gen5GlobalMemoryBinding>();
+        var throwawayByAddress =
+            new Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding>();
+        var throwawayRuntime = new HashSet<uint>();
+
+        foreach (var instruction in state.Program.Instructions)
+        {
+            if (instruction.Opcode == "SEndpgm")
+            {
+                break;
+            }
+
+            // Keep walking linearly through both sides of branches so MIMG in
+            // alternate paths still sees prologue SRDs / scalar loads.
+            if (instruction.Opcode == "SBranch" ||
+                instruction.Opcode.StartsWith("SCbranch", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
+            {
+                _ = TryExecuteScalarCompare(
+                    instruction,
+                    scalarRegisters,
+                    out scalarConditionCode,
+                    out _);
+                continue;
+            }
+
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopk &&
+                instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
+            {
+                _ = TryExecuteScalarCompareK(
+                    instruction,
+                    scalarRegisters,
+                    out scalarConditionCode,
+                    out _);
+                continue;
+            }
+
+            if (instruction.Encoding is
+                Gen5ShaderEncoding.Sop1 or
+                Gen5ShaderEncoding.Sop2 or
+                Gen5ShaderEncoding.Sopk)
+            {
+                if (instruction.Opcode is "SSetpcB64" or "SSwappcB64")
+                {
+                    continue;
+                }
+
+                _ = TryExecuteScalarAlu(
+                    instruction,
+                    state.Program.Address,
+                    scalarRegisters,
+                    ref execMask,
+                    ref scalarConditionCode,
+                    out _);
+                continue;
+            }
+
+            if (instruction.Control is Gen5ScalarMemoryControl scalarMemory)
+            {
+                _ = TryExecuteScalarLoad(
+                    ctx,
+                    state,
+                    instruction,
+                    scalarMemory,
+                    scalarRegisters,
+                    throwawayBindings,
+                    throwawayByAddress,
+                    throwawayRuntime,
+                    out _);
+                continue;
+            }
+
+            if (instruction.Control is not Gen5ImageControl image ||
+                boundPcs.Contains(instruction.Pc))
+            {
+                continue;
+            }
+
+            // Best-effort: skip a single bad MIMG rather than failing the whole shader.
+            if (TryAddImageBinding(
+                    state.Program,
+                    instruction,
+                    image,
+                    scalarRegisters,
+                    resolved,
+                    boundPcs,
+                    out _))
+            {
+                continue;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryAddImageBinding(
+        Gen5ShaderProgram program,
+        Gen5ShaderInstruction instruction,
+        Gen5ImageControl image,
+        uint[] scalarRegisters,
+        List<Gen5ImageBinding> resolved,
+        HashSet<uint>? boundPcs,
+        out string error)
+    {
+        error = string.Empty;
+        if (boundPcs is not null && !boundPcs.Add(instruction.Pc))
+        {
+            return true;
+        }
+
+        if (!TryCopyRegisters(
+                scalarRegisters,
+                image.ScalarResource,
+                ImageDescriptorDwords,
+                out var resourceDescriptor))
+        {
+            error = $"resource-register-range pc=0x{instruction.Pc:X} s{image.ScalarResource}";
+            boundPcs?.Remove(instruction.Pc);
+            return false;
+        }
+
+        IReadOnlyList<uint> samplerDescriptor = [];
+        if (UsesSampler(instruction.Opcode) &&
+            !TryCopyRegisters(
+                scalarRegisters,
+                image.ScalarSampler,
+                SamplerDescriptorDwords,
+                out samplerDescriptor))
+        {
+            error = $"sampler-register-range pc=0x{instruction.Pc:X} s{image.ScalarSampler}";
+            boundPcs?.Remove(instruction.Pc);
+            return false;
+        }
+
+        resolved.Add(new Gen5ImageBinding(
+            instruction.Pc,
+            instruction.Opcode,
+            image,
+            resourceDescriptor,
+            samplerDescriptor,
+            instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
+            TryResolveVectorConstantBefore(
+                program,
+                instruction.Pc,
+                image.GetAddressRegister(2),
+                out var mipLevel)
+                ? mipLevel
+                : null));
         return true;
     }
 
