@@ -3427,53 +3427,81 @@ internal static unsafe class VulkanVideoPresenter
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
             if (texture.Address != 0 &&
                 _guestImages.TryGetValue(texture.Address, out var guestImage) &&
-                IsCompatibleGuestImageAlias(texture, guestImage) &&
-                IsCompatibleViewFormat(guestImage.Format, vkFormat) &&
-                TryGetOrCreateGuestImageView(
-                    guestImage,
-                    vkFormat,
-                    mipLevel: 0,
-                    levelCount: guestImage.MipLevels,
-                    dstSelect: texture.DstSelect,
-                    out var view))
+                IsCompatibleGuestImageAlias(texture, guestImage))
             {
-                if (ShouldTraceVulkanResources() &&
-                    _tracedTextureCacheHits.Add(
-                        (texture.Address, texture.Width, texture.Height, vkFormat)))
+                var viewFormat = vkFormat;
+                var usedImageFormatView = false;
+                if (!IsCompatibleViewFormat(guestImage.Format, vkFormat))
                 {
-                    Console.Error.WriteLine(
-                        $"[LOADER][TRACE] vk.texture_cache_hit addr=0x{texture.Address:X16} " +
-                        $"size={texture.Width}x{texture.Height} " +
-                        $"image_format={guestImage.Format} view_format={vkFormat}");
+                    // SRD view format can disagree with the last RT write (e.g. fmt36
+                    // R8Unorm over a B10G11R11 bloom target). Prefer the published GPU
+                    // image over a zero guest-RAM upload when content already exists.
+                    if (guestImage.Initialized &&
+                        !guestImage.IsCpuBacked)
+                    {
+                        viewFormat = guestImage.Format;
+                        usedImageFormatView = true;
+                    }
+                    else
+                    {
+                        guestImage = null!;
+                    }
                 }
 
-                if (guestImage.Width != texture.Width ||
-                    guestImage.Height != texture.Height)
+                if (guestImage is not null &&
+                    TryGetOrCreateGuestImageView(
+                        guestImage,
+                        viewFormat,
+                        mipLevel: 0,
+                        levelCount: guestImage.MipLevels,
+                        dstSelect: texture.DstSelect,
+                        out var view))
                 {
-                    TraceVulkanShader(
-                        $"vk.texture_cache_alias addr=0x{texture.Address:X16} " +
-                        $"texture={texture.Width}x{texture.Height} " +
-                        $"image={guestImage.Width}x{guestImage.Height} " +
-                        $"tile={texture.TileMode} format={vkFormat}");
-                }
+                    if (usedImageFormatView)
+                    {
+                        TraceVulkanShader(
+                            $"vk.texture_gpu_alias addr=0x{texture.Address:X16} " +
+                            $"size={guestImage.Width}x{guestImage.Height} " +
+                            $"requested={vkFormat} image={guestImage.Format}");
+                    }
+                    else if (ShouldTraceVulkanResources() &&
+                        _tracedTextureCacheHits.Add(
+                            (texture.Address, texture.Width, texture.Height, vkFormat)))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.texture_cache_hit addr=0x{texture.Address:X16} " +
+                            $"size={texture.Width}x{texture.Height} " +
+                            $"image_format={guestImage.Format} view_format={vkFormat}");
+                    }
 
-                if (TryCreateCpuTextureRefreshResource(texture, guestImage, view, out var refresh))
-                {
-                    return refresh;
-                }
+                    if (guestImage.Width != texture.Width ||
+                        guestImage.Height != texture.Height)
+                    {
+                        TraceVulkanShader(
+                            $"vk.texture_cache_alias addr=0x{texture.Address:X16} " +
+                            $"texture={texture.Width}x{texture.Height} " +
+                            $"image={guestImage.Width}x{guestImage.Height} " +
+                            $"tile={texture.TileMode} format={viewFormat}");
+                    }
 
-                return new TextureResource
-                {
-                    Address = texture.Address,
-                    Image = guestImage.Image,
-                    View = view,
-                    Width = guestImage.Width,
-                    Height = guestImage.Height,
-                    RowLength = guestImage.Width,
-                    DstSelect = texture.DstSelect,
-                    SamplerState = texture.Sampler,
-                    GuestImage = guestImage,
-                };
+                    if (TryCreateCpuTextureRefreshResource(texture, guestImage, view, out var refresh))
+                    {
+                        return refresh;
+                    }
+
+                    return new TextureResource
+                    {
+                        Address = texture.Address,
+                        Image = guestImage.Image,
+                        View = view,
+                        Width = guestImage.Width,
+                        Height = guestImage.Height,
+                        RowLength = guestImage.Width,
+                        DstSelect = texture.DstSelect,
+                        SamplerState = texture.Sampler,
+                        GuestImage = guestImage,
+                    };
+                }
             }
 
             return CreateTextureResource(texture);
