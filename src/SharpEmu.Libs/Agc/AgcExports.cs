@@ -1438,6 +1438,33 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "u2T2DiA5hRI",
+        ExportName = "sceAgcDcbStallCommandBufferParser",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbStallCommandBufferParser(CpuContext ctx)
+    {
+        // GNM/AGC: stallCommandBufferParser() is a fixed EVENT_WRITE with
+        // kEventTypeCsPartialFlush (0x07). Same 2-dword form as DcbEventWrite.
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        const uint csPartialFlush = 0x07;
+        if (commandBufferAddress == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
+            !ctx.TryWriteUInt32(commandAddress, Pm4(2, ItEventWrite, 0)) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, csPartialFlush))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_stall_command_buffer_parser buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
         Nid = "57labkp+rSQ",
         ExportName = "sceAgcDcbAcquireMem",
         Target = Generation.Gen5,
