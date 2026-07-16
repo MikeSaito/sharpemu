@@ -126,6 +126,8 @@ public static class KernelSemaphoreCompatExports
         }
 
         var pollTimedOut = false;
+        var hostFallback = false;
+        var hostFallbackCancelEpoch = 0;
         lock (semaphore.Gate)
         {
             if (semaphore.Count >= needCount)
@@ -192,14 +194,24 @@ public static class KernelSemaphoreCompatExports
                         resumeHandler: () => CompleteBlockedSemaWait(semaphore, waiter),
                         wakeHandler: () => TryConsumeBlockedSemaWait(semaphore, waiter)))
                 {
-                    TraceSemaphore($"wait-would-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
-                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                    // Host-owned threads cannot park; spin with Pump until SignalSema
+                    // (same idea as POSIX sem_wait HostFallbackWait). Do not return
+                    // TRY_AGAIN — infinite waits treat that as a hard failure.
+                    hostFallback = true;
+                    hostFallbackCancelEpoch = semaphore.CancelEpoch;
                 }
-
-                semaphore.WaitingThreads++;
-                TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
-                return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+                else
+                {
+                    semaphore.WaitingThreads++;
+                    TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+                }
             }
+        }
+
+        if (hostFallback)
+        {
+            return HostFallbackWait(ctx, handle, semaphore, needCount, hostFallbackCancelEpoch);
         }
 
         GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelWaitSema");
@@ -213,6 +225,49 @@ public static class KernelSemaphoreCompatExports
         }
 
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+    }
+
+    private static int HostFallbackWait(
+        CpuContext ctx,
+        uint handle,
+        KernelSemaphoreState semaphore,
+        int needCount,
+        int cancelEpochAtWait)
+    {
+        while (true)
+        {
+            lock (semaphore.Gate)
+            {
+                if (semaphore.Deleted)
+                {
+                    TraceSemaphore($"wait-host-deleted handle=0x{handle:X8} name='{semaphore.Name}' need={needCount}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_DELETED);
+                }
+
+                if (semaphore.CancelEpoch != cancelEpochAtWait)
+                {
+                    TraceSemaphore($"wait-host-canceled handle=0x{handle:X8} name='{semaphore.Name}' need={needCount}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_CANCELED);
+                }
+
+                if (semaphore.Count >= needCount)
+                {
+                    semaphore.Count -= needCount;
+                    TraceSemaphore($"wait-host handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                    return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+                }
+            }
+
+            GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelWaitSema");
+            if ((++_semaPollBackoffCount & 255) == 0)
+            {
+                Thread.Sleep(0);
+            }
+            else
+            {
+                Thread.Yield();
+            }
+        }
     }
 
     [SysAbiExport(
