@@ -1,8 +1,9 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using SharpEmu.HLE;
+using System.Collections.Concurrent;
 using System.Buffers.Binary;
+using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Audio;
 
@@ -16,9 +17,64 @@ public static class AudioOut2Exports
     // populate.
     private const int AudioOut2ContextParamSize = 0x30;
     private const int AudioOut2ContextMemorySize = 0x10000;
+    private const int PortStateSize = 0x20;
+    // Observed call sites pass attribute arrays; entries are tagged unions of
+    // { int32 attributeId; int32 pad; uint64 value; } (16 bytes).
+    private const int AttributeEntrySize = 0x10;
+    private const int MaxAttributeCount = 64;
+
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
+    private static readonly ConcurrentDictionary<ulong, AudioOut2PortState> _ports = new();
+
+    private sealed class AudioOut2PortState
+    {
+        public required int Type { get; init; }
+        public ushort Output { get; set; }
+        public byte Channels { get; set; }
+        // GetState field at +0x04; -1 means "unset" in the previous stub defaults.
+        public short Status { get; set; }
+        public Dictionary<int, ulong> Attributes { get; } = new();
+    }
+
+    private static AudioOut2PortState CreateDefaultPortState(int type) => new()
+    {
+        Type = type,
+        Output = unchecked((ushort)(type == 2 ? 0x40 : 0x01)),
+        Channels = unchecked((byte)(type == 2 ? 1 : 2)),
+        Status = -1,
+    };
+
+    private static void WritePortState(Span<byte> destination, AudioOut2PortState port)
+    {
+        destination.Clear();
+        BinaryPrimitives.WriteUInt16LittleEndian(destination[0x00..], port.Output);
+        destination[0x02] = port.Channels;
+        BinaryPrimitives.WriteInt16LittleEndian(destination[0x04..], port.Status);
+    }
+
+    private static void ApplyAttribute(AudioOut2PortState port, int attributeId, ulong value)
+    {
+        port.Attributes[attributeId] = value;
+
+        // Map the fields PortGetState already exposes. Unknown tags stay in the
+        // attribute table for later layout discovery without game-specific hacks.
+        switch (attributeId)
+        {
+            case 0:
+            case 1:
+                port.Output = unchecked((ushort)value);
+                break;
+            case 2:
+                port.Channels = unchecked((byte)value);
+                break;
+            case 3:
+            case 4:
+                port.Status = unchecked((short)value);
+                break;
+        }
+    }
 
     [SysAbiExport(
         Nid = "g2tViFIohHE",
@@ -179,9 +235,14 @@ public static class AudioOut2Exports
 
         var portId = unchecked((uint)Interlocked.Increment(ref _nextPortId)) & 0xFF;
         var handle = 0x2000_0000UL | ((ulong)(uint)type << 16) | portId;
-        return ctx.TryWriteUInt64(outPortAddress, handle)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        _ports[handle] = CreateDefaultPortState(type);
+        if (!ctx.TryWriteUInt64(outPortAddress, handle))
+        {
+            _ports.TryRemove(handle, out _);
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(0);
     }
 
     [SysAbiExport(
@@ -198,14 +259,15 @@ public static class AudioOut2Exports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        var type = (int)((handle >> 16) & 0xFF);
-        Span<byte> state = stackalloc byte[0x20];
-        state.Clear();
-        var output = type == 2 ? 0x40 : 0x01;
-        var channels = type == 2 ? 1 : 2;
-        BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], unchecked((ushort)output));
-        state[0x02] = unchecked((byte)channels);
-        BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], -1);
+        if (!_ports.TryGetValue(handle, out var port))
+        {
+            var type = (int)((handle >> 16) & 0xFF);
+            port = CreateDefaultPortState(type);
+            _ports[handle] = port;
+        }
+
+        Span<byte> state = stackalloc byte[PortStateSize];
+        WritePortState(state, port);
 
         return ctx.Memory.TryWrite(stateAddress, state)
             ? ctx.SetReturn(0)
@@ -221,13 +283,44 @@ public static class AudioOut2Exports
     {
         var handle = ctx[CpuRegister.Rdi];
         var attributeAddress = ctx[CpuRegister.Rsi];
-        if (handle == 0 || attributeAddress == 0)
+        var attributeCount = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (handle == 0 || attributeAddress == 0 || attributeCount < 0 || attributeCount > MaxAttributeCount)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // Attribute payload is guest-owned; accept and acknowledge until real
-        // AudioOut2 mixing needs to honor volume/routing fields.
+        if (!_ports.TryGetValue(handle, out var port))
+        {
+            var type = (int)((handle >> 16) & 0xFF);
+            port = CreateDefaultPortState(type);
+            _ports[handle] = port;
+        }
+
+        if (attributeCount == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        Span<byte> entry = stackalloc byte[AttributeEntrySize];
+        for (var i = 0; i < attributeCount; i++)
+        {
+            if (!ctx.Memory.TryRead(attributeAddress + (ulong)(i * AttributeEntrySize), entry))
+            {
+                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            var attributeId = BinaryPrimitives.ReadInt32LittleEndian(entry);
+            var value = BinaryPrimitives.ReadUInt64LittleEndian(entry[0x08..]);
+            ApplyAttribute(port, attributeId, value);
+        }
+
+        // A successful SetAttributes clears the previous "unset" status so
+        // GetState no longer looks like a fresh PortCreate default forever.
+        if (port.Status == -1)
+        {
+            port.Status = 0;
+        }
+
         return ctx.SetReturn(0);
     }
 
@@ -260,7 +353,16 @@ public static class AudioOut2Exports
         ExportName = "sceAudioOut2PortDestroy",
         Target = Generation.Gen5,
         LibraryName = "libSceAudioOut2")]
-    public static int AudioOut2PortDestroy(CpuContext ctx) => ctx.SetReturn(0);
+    public static int AudioOut2PortDestroy(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        if (handle != 0)
+        {
+            _ports.TryRemove(handle, out _);
+        }
+
+        return ctx.SetReturn(0);
+    }
 
     [SysAbiExport(
         Nid = "IaZXJ9M79uo",
