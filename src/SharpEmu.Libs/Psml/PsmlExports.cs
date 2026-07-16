@@ -21,6 +21,8 @@ public static class PsmlExports
     private static int _mfsrInitialized;
     private static readonly Lock SharedResourcesGate = new();
     private static readonly Dictionary<ulong, SharedResourcesState> SharedResourcesByDescriptor = new();
+    private static readonly Lock ContextGate = new();
+    private static readonly Dictionary<ulong, ContextState> ContextsByAddress = new();
 
     [SysAbiExport(
         Nid = "3WVD91e12ZQ",
@@ -134,6 +136,54 @@ public static class PsmlExports
         return ctx.SetReturn(0);
     }
 
+    [SysAbiExport(
+        Nid = "gxv3i+MTEzU",
+        ExportName = "scePsmlMfsrCreateContext800M3_2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePsml")]
+    public static int PsmlMfsrCreateContext800M3_2(CpuContext ctx)
+    {
+        var contextAddress = ctx[CpuRegister.Rdi];
+        var requirementAddress = ctx[CpuRegister.Rsi];
+        var structSize = ctx[CpuRegister.Rdx];
+        var sharedDirectMemory = ctx[CpuRegister.Rcx];
+        var pageSize = ctx[CpuRegister.R8];
+        if (contextAddress == 0 || sharedDirectMemory == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var sharedState = TryFindSharedResources(sharedDirectMemory, contextAddress);
+        var effectiveStructSize = structSize != 0 ? structSize : RequirementStructSize;
+        var effectivePageSize = pageSize != 0 ? pageSize : SharedResourcesPageSize;
+        var sharedDescriptor = sharedState?.DescriptorAddress ?? contextAddress - 0x30;
+        var bufferSize = sharedState?.BufferSizeBytes ?? ContextBufferSizeBytes;
+
+        var state = new ContextState(
+            ContextAddress: contextAddress,
+            SharedResourcesDescriptor: sharedDescriptor,
+            DirectMemoryAddress: sharedDirectMemory,
+            BufferSizeBytes: bufferSize,
+            PageSizeBytes: effectivePageSize,
+            StructSizeBytes: effectiveStructSize);
+
+        if (!WriteContextObject(ctx, state))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        lock (ContextGate)
+        {
+            ContextsByAddress[contextAddress] = state;
+        }
+
+        TracePsml(
+            $"mfsr_create_context_800m3_2 ctx=0x{contextAddress:X16} req=0x{requirementAddress:X16} " +
+            $"struct=0x{effectiveStructSize:X} direct=0x{sharedDirectMemory:X16} " +
+            $"shared_desc=0x{sharedDescriptor:X16} buf_size=0x{bufferSize:X} page=0x{effectivePageSize:X}");
+        return ctx.SetReturn(0);
+    }
+
     private static bool WriteMemoryRequirement(CpuContext ctx, ulong address, ulong sizeBytes)
     {
         return ctx.TryWriteUInt64(address, RequirementStructSize) &&
@@ -143,9 +193,47 @@ public static class PsmlExports
 
     private static ulong ReadRequirementSize(CpuContext ctx, ulong address, ulong fallback)
     {
-        return ctx.TryReadUInt64(address + 0x08, out var sizeBytes) && sizeBytes != 0
-            ? sizeBytes
-            : fallback;
+        if (!ctx.TryReadUInt64(address + 0x08, out var sizeBytes) || sizeBytes == 0)
+        {
+            return fallback;
+        }
+
+        // Guest requirement structs use size @8; reject pointer-like garbage.
+        return sizeBytes > 0x1000_0000UL ? fallback : sizeBytes;
+    }
+
+    private static SharedResourcesState? TryFindSharedResources(ulong directMemoryAddress, ulong contextAddress)
+    {
+        lock (SharedResourcesGate)
+        {
+            foreach (var state in SharedResourcesByDescriptor.Values)
+            {
+                if (state.DirectMemoryAddress == directMemoryAddress)
+                {
+                    return state;
+                }
+            }
+
+            var inferredDescriptor = contextAddress >= 0x30 ? contextAddress - 0x30 : 0;
+            if (inferredDescriptor != 0 &&
+                SharedResourcesByDescriptor.TryGetValue(inferredDescriptor, out var byDescriptor))
+            {
+                return byDescriptor;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool WriteContextObject(CpuContext ctx, ContextState state)
+    {
+        return ctx.TryWriteUInt64(state.ContextAddress + 0x00, state.StructSizeBytes) &&
+               ctx.TryWriteUInt64(state.ContextAddress + 0x08, state.DirectMemoryAddress) &&
+               ctx.TryWriteUInt64(state.ContextAddress + 0x10, state.SharedResourcesDescriptor) &&
+               ctx.TryWriteUInt64(state.ContextAddress + 0x18, state.BufferSizeBytes) &&
+               ctx.TryWriteUInt64(state.ContextAddress + 0x20, state.PageSizeBytes) &&
+               ctx.TryWriteUInt64(state.ContextAddress + 0x28, state.ContextAddress) &&
+               ctx.TryWriteUInt64(state.ContextAddress + 0x30, state.DirectMemoryAddress);
     }
 
     private static bool WriteSharedResourcesDescriptor(CpuContext ctx, SharedResourcesState state)
@@ -154,10 +242,10 @@ public static class PsmlExports
         // descriptor as initialized guest memory instead of an all-zero placeholder.
         return ctx.TryWriteUInt64(state.DescriptorAddress + 0x00, RequirementStructSize) &&
                ctx.TryWriteUInt64(state.DescriptorAddress + 0x08, state.DirectMemoryAddress) &&
-               ctx.TryWriteUInt64(state.DescriptorAddress + 0x10, state.BufferSizeBytes) &&
-               ctx.TryWriteUInt64(state.DescriptorAddress + 0x18, state.ContextSizeBytes) &&
-               ctx.TryWriteUInt64(state.DescriptorAddress + 0x20, state.PageSizeBytes) &&
-               ctx.TryWriteUInt64(state.DescriptorAddress + 0x28, state.DescriptorAddress) &&
+               ctx.TryWriteUInt64(state.DescriptorAddress + 0x10, state.DirectMemoryAddress) &&
+               ctx.TryWriteUInt64(state.DescriptorAddress + 0x18, state.BufferSizeBytes) &&
+               ctx.TryWriteUInt64(state.DescriptorAddress + 0x20, state.ContextSizeBytes) &&
+               ctx.TryWriteUInt64(state.DescriptorAddress + 0x28, state.PageSizeBytes) &&
                ctx.TryWriteUInt64(state.DescriptorAddress + 0x30, state.DirectMemoryAddress) &&
                ctx.TryWriteUInt64(state.DescriptorAddress + 0x38, state.BufferSizeBytes + state.ContextSizeBytes);
     }
@@ -176,4 +264,12 @@ public static class PsmlExports
         ulong BufferSizeBytes,
         ulong ContextSizeBytes,
         ulong PageSizeBytes);
+
+    private readonly record struct ContextState(
+        ulong ContextAddress,
+        ulong SharedResourcesDescriptor,
+        ulong DirectMemoryAddress,
+        ulong BufferSizeBytes,
+        ulong PageSizeBytes,
+        ulong StructSizeBytes);
 }
