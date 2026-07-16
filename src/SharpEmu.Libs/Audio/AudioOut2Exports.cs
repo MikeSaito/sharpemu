@@ -156,6 +156,25 @@ public static class AudioOut2Exports
     }
 
     [SysAbiExport(
+        Nid = "8XTArSPyWHk",
+        ExportName = "sceAudioOut2PortSetAttributes",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2PortSetAttributes(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var attributeAddress = ctx[CpuRegister.Rsi];
+        if (handle == 0 || attributeAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // Attribute payload is guest-owned; accept and acknowledge until real
+        // AudioOut2 mixing needs to honor volume/routing fields.
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "DImz2Ft9E2g",
         ExportName = "sceAudioOut2GetSpeakerInfo",
         Target = Generation.Gen5,
