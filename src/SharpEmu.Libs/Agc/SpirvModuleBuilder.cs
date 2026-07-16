@@ -297,7 +297,10 @@ internal enum SpirvImageFormat : uint
 internal sealed class SpirvModuleBuilder
 {
     private const uint Magic = 0x07230203;
-    private const uint Version15 = 0x00010500;
+    // Vulkan entry-point interface rules are stable at 1.0 (Input/Output only).
+    // SPIR-V 1.4+ requires listing every global, which has crashed nvgpucomp on
+    // modules that also list Private SGPR/VGPR arrays and StorageBuffer blocks.
+    private const uint Version10 = 0x00010000;
     private const uint Generator = 0x53504500; // "SPE"
 
     private readonly List<uint> _capabilities = [];
@@ -783,7 +786,7 @@ internal sealed class SpirvModuleBuilder
         var words = new uint[wordCount];
         var offset = 0;
         WriteWord(Magic);
-        WriteWord(Version15);
+        WriteWord(Version10);
         WriteWord(Generator);
         WriteWord(_nextId);
         WriteWord(0);

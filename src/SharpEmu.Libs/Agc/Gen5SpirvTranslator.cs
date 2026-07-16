@@ -396,13 +396,7 @@ internal static partial class Gen5SpirvTranslator
                 _privateBoolPointer,
                 SpirvStorageClass.Private,
                 _module.ConstantBool(true));
-            _interfaces.Add(_scalarRegisters);
-            _interfaces.Add(_vectorRegisters);
-            _interfaces.Add(_scc);
-            _interfaces.Add(_vcc);
-            _interfaces.Add(_exec);
-            _interfaces.Add(_programCounter);
-            _interfaces.Add(_programActive);
+            // Entry-point interface must only list Input/Output for Vulkan SPIR-V 1.0.
             _module.AddName(_scalarRegisters, "sgpr");
             _module.AddName(_vectorRegisters, "vgpr");
 
@@ -428,7 +422,6 @@ internal static partial class Gen5SpirvTranslator
                 ldsPointer,
                 SpirvStorageClass.Workgroup);
             _module.AddName(_lds, "lds");
-            _interfaces.Add(_lds);
         }
 
         private void DeclareBuffers()
@@ -464,7 +457,6 @@ internal static partial class Gen5SpirvTranslator
             _module.AddName(_globalBuffers, "guestBuffers");
             _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, 0);
-            _interfaces.Add(_globalBuffers);
         }
 
         private void DeclareImages()
@@ -528,7 +520,6 @@ internal static partial class Gen5SpirvTranslator
                         _module.TypeVector(componentType, 4),
                         componentKind,
                         isStorage));
-                _interfaces.Add(variable);
             }
         }
 

@@ -92,6 +92,45 @@ internal static class SpirvFixedShaders
         return module.Build();
     }
 
+    public static byte[] CreateSolidColorFragment(float red, float green, float blue, float alpha)
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var floatType = module.TypeFloat(32);
+        var vec4Type = module.TypeVector(floatType, 4);
+        var outputVec4Pointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+
+        var output = module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+        module.AddName(output, "outColor");
+        module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+
+        var color = module.AddInstruction(
+            SpirvOp.CompositeConstruct,
+            vec4Type,
+            module.ConstantFloat(floatType, red),
+            module.ConstantFloat(floatType, green),
+            module.ConstantFloat(floatType, blue),
+            module.ConstantFloat(floatType, alpha));
+        module.AddStatement(SpirvOp.Store, output, color);
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(
+            SpirvExecutionModel.Fragment,
+            main,
+            "main",
+            [output]);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        return module.Build();
+    }
+
     public static byte[] CreateCopyFragment()
     {
         var module = new SpirvModuleBuilder();
@@ -156,11 +195,12 @@ internal static class SpirvFixedShaders
         module.AddStatement(SpirvOp.Return);
         module.EndFunction();
 
+        // Vulkan SPIR-V 1.0 entry-point interface is Input/Output only.
         module.AddEntryPoint(
             SpirvExecutionModel.Fragment,
             main,
             "main",
-            [attribute, texture, output]);
+            [attribute, output]);
         module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
         return module.Build();
     }

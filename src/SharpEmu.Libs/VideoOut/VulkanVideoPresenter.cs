@@ -170,11 +170,7 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly object _gate = new();
     private static readonly object _pipelineBanGate = new();
     private static readonly HashSet<string> _bannedTranslatedGraphicsSpirvPairs = new(StringComparer.Ordinal);
-    private static readonly HashSet<(ulong Es, ulong Ps)> _crashProneGuestShaderPairs =
-    [
-        // Astro Bot: nvgpucomp64 AV (null@+0x10) during CreateGraphicsPipelines for this ES/PS pair.
-        (0x0000000808E88D00UL, 0x0000000808E88000UL),
-    ];
+    private static readonly HashSet<(ulong Es, ulong Ps)> _crashProneGuestShaderPairs = [];
     private static readonly Queue<object> _pendingGuestWork = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     private static readonly Dictionary<ulong, uint> _gpuGuestImages = new();
