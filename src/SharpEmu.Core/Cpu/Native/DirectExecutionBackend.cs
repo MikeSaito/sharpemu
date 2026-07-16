@@ -2293,13 +2293,48 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe void PatchTlsPatterns()
 	{
-		const ulong MaxScanBytes = 33554432uL;
-		ulong num = _entryPoint;
-		ulong num2 = num + MaxScanBytes;
+		// Scan the full mapped allocation that owns the entry point. Large eboots
+		// (250+ MiB) place TLS loads far past the old entry+32MiB window.
+		const ulong FallbackScanBytes = 33554432uL;
+		ulong scanStart = _entryPoint;
+		ulong scanEndExclusive = _entryPoint + FallbackScanBytes;
+		if (VirtualQuery((void*)_entryPoint, out var entryInfo, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0 &&
+			entryInfo.RegionSize != 0)
+		{
+			var allocationBase = entryInfo.AllocationBase != 0 ? entryInfo.AllocationBase : entryInfo.BaseAddress;
+			scanStart = allocationBase;
+			scanEndExclusive = allocationBase;
+			var cursor = allocationBase;
+			while (true)
+			{
+				if (VirtualQuery((void*)cursor, out var regionInfo, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+					regionInfo.RegionSize == 0 ||
+					regionInfo.AllocationBase != allocationBase)
+				{
+					break;
+				}
+
+				var regionEnd = regionInfo.BaseAddress + regionInfo.RegionSize;
+				if (regionEnd > scanEndExclusive)
+				{
+					scanEndExclusive = regionEnd;
+				}
+
+				var next = regionEnd > cursor ? regionEnd : cursor + 4096uL;
+				if (next <= cursor)
+				{
+					break;
+				}
+
+				cursor = next;
+			}
+		}
+
 		int num3 = 0;
 		int num4 = 0;
 		int num9 = 0;
-		while (num < num2)
+		ulong num = scanStart;
+		while (num < scanEndExclusive)
 		{
 			if (VirtualQuery((void*)num, out var lpBuffer, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 || lpBuffer.RegionSize == 0)
 			{
@@ -2308,38 +2343,55 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			ulong num5 = Math.Max(num, lpBuffer.BaseAddress);
 			ulong num6 = lpBuffer.BaseAddress + lpBuffer.RegionSize;
-			if (num6 > num2)
+			if (num6 > scanEndExclusive)
 			{
-				num6 = num2;
+				num6 = scanEndExclusive;
 			}
 			uint num7 = lpBuffer.Protect & 0xFF;
 			bool flag = lpBuffer.State == 4096 && (lpBuffer.Protect & PAGE_GUARD) == 0 && num7 != PAGE_NOACCESS;
 			bool flag2 = num7 == PAGE_EXECUTE || num7 == 32 || num7 == 64 || num7 == PAGE_EXECUTE_WRITECOPY;
-			if (flag && flag2 && num6 > num5 + MinTlsPatchInstructionBytes)
+			if (flag && flag2 && num6 > num5 + (ulong)MinTlsPatchInstructionBytes)
 			{
-				byte* ptr = (byte*)num5;
-				int scanBytes = (int)(num6 - num5);
-				for (int i = 0; i <= scanBytes - MinTlsPatchInstructionBytes; i++)
+				const ulong ChunkBytes = 16uL * 1024 * 1024;
+				const int ChunkOverlap = 32;
+				ulong regionCursor = num5;
+				while (regionCursor + (ulong)MinTlsPatchInstructionBytes <= num6)
 				{
-					nint address = (nint)(ptr + i);
-					int remainingBytes = scanBytes - i;
-					if (TryPatchTlsLoadInstruction(address, ptr + i, remainingBytes))
+					var remaining = num6 - regionCursor;
+					var scanBytes = (int)Math.Min(remaining, ChunkBytes);
+					byte* ptr = (byte*)regionCursor;
+					for (int i = 0; i <= scanBytes - MinTlsPatchInstructionBytes; i++)
 					{
-						num3++;
+						nint address = (nint)(ptr + i);
+						int remainingBytes = scanBytes - i;
+						if (TryPatchTlsLoadInstruction(address, ptr + i, remainingBytes))
+						{
+							num3++;
+						}
+						else if (remainingBytes >= 12 && TryPatchTlsImmediateStoreInstruction(address, ptr + i))
+						{
+							num9++;
+						}
+						else if (TryPatchStackCanaryInstruction(address, ptr + i))
+						{
+							num4++;
+						}
 					}
-					else if (remainingBytes >= 12 && TryPatchTlsImmediateStoreInstruction(address, ptr + i))
+
+					if ((ulong)scanBytes >= remaining)
 					{
-						num9++;
+						break;
 					}
-					else if (TryPatchStackCanaryInstruction(address, ptr + i))
-					{
-						num4++;
-					}
+
+					var advance = (ulong)Math.Max(scanBytes - ChunkOverlap, 1);
+					regionCursor += advance;
 				}
 			}
 			num = num6 > num ? num6 : num + 4096uL;
 		}
-		Console.Error.WriteLine($"[LOADER][INFO] Patched {num3} TLS loads, {num9} TLS stores, {num4} stack-canary accesses");
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] Patched {num3} TLS loads, {num9} TLS stores, {num4} stack-canary accesses " +
+			$"(scan=0x{scanStart:X16}..0x{scanEndExclusive:X16})");
 	}
 
 	private unsafe bool IsPatternMatch(byte* ptr, byte[] pattern)

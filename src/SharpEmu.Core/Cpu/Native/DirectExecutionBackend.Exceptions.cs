@@ -259,11 +259,17 @@ public sealed partial class DirectExecutionBackend
 						byte[] code = new byte[16];
 						Marshal.Copy((nint)rip, code, 0, code.Length);
 						Console.Error.WriteLine("[LOADER][INFO]   Code at RIP: " + BitConverter.ToString(code).Replace("-", " "));
-						if (code[0] == 100)
+						var opcodeOffset = 0;
+						while (opcodeOffset < code.Length && code[opcodeOffset] == 0x66)
+						{
+							opcodeOffset++;
+						}
+
+						if (opcodeOffset < code.Length && code[opcodeOffset] == 100)
 						{
 							Console.Error.WriteLine("[LOADER][ERROR]   Detected FS segment prefix - TLS access not patched!");
 						}
-						else if (code[0] == 101)
+						else if (opcodeOffset < code.Length && code[opcodeOffset] == 101)
 						{
 							Console.Error.WriteLine("[LOADER][ERROR]   Detected GS segment prefix - TLS access not patched!");
 						}
