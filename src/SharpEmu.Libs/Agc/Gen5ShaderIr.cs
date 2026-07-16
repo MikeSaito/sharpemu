@@ -270,7 +270,10 @@ internal sealed record Gen5GlobalMemoryBinding(
     uint ScalarAddress,
     ulong BaseAddress,
     IReadOnlyList<uint> InstructionPcs,
-    byte[] Data);
+    byte[] Data,
+    bool Writable = false,
+    uint DataFormat = 0,
+    uint NumberFormat = 0);
 
 internal sealed record Gen5VertexInputBinding(
     uint Pc,

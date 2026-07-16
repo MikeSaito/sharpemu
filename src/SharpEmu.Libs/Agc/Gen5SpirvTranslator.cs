@@ -1300,8 +1300,12 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            // SMEM soffset 0x7C/0x7D encode immediate 0 (SGPR_NULL / inline zero),
+            // not a live SGPR — LoadS(125) would read an unrelated private slot.
             var dynamicOffset = control.DynamicOffsetRegister is { } register
-                ? LoadS(register)
+                ? register is 124 or 125
+                    ? UInt(0)
+                    : LoadS(register)
                 : UInt(0);
             var byteAddress = IAdd(
                 dynamicOffset,
@@ -1384,6 +1388,25 @@ internal static partial class Gen5SpirvTranslator
                 : UInt(0);
             var stride = ShiftRightLogical(LoadS(control.ScalarResource + 1), UInt(16));
             stride = BitwiseAnd(stride, UInt(0x3FFF));
+            if (IsFormatBufferOpcode(instruction.Opcode) &&
+                TryGetBufferBindingFormat(bindingIndex, out var strideDataFormat, out _) &&
+                GetBufferDataFormatElementBytes(strideDataFormat) is var elementBytes and > 0)
+            {
+                // GFX: stride 0 means "tightly packed" — use the typed element size.
+                var formatStride = UInt(elementBytes);
+                var strideIsZero = _module.AddInstruction(
+                    SpirvOp.IEqual,
+                    _boolType,
+                    stride,
+                    UInt(0));
+                stride = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    strideIsZero,
+                    formatStride,
+                    stride);
+            }
+
             var vectorIndex = control.IndexEnabled
                 ? LoadV(control.VectorAddress)
                 : UInt(0);
@@ -1419,10 +1442,20 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal))
+            if (instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("TBufferStore", StringComparison.Ordinal))
             {
                 EmitExecConditional(() =>
                 {
+                    if (IsFormatBufferStore(instruction.Opcode) &&
+                        TryEmitTypedFormatBufferStore(
+                            bindingIndex,
+                            control,
+                            byteAddress))
+                    {
+                        return;
+                    }
+
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
                         var address = index == 0
@@ -1461,6 +1494,286 @@ internal static partial class Gen5SpirvTranslator
         private static bool IsFormatBufferLoad(string opcode) =>
             opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal) ||
             opcode.StartsWith("TBufferLoadFormat", StringComparison.Ordinal);
+
+        private static bool IsFormatBufferStore(string opcode) =>
+            opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal) ||
+            opcode.StartsWith("TBufferStoreFormat", StringComparison.Ordinal);
+
+        private static bool IsFormatBufferOpcode(string opcode) =>
+            IsFormatBufferLoad(opcode) || IsFormatBufferStore(opcode);
+
+        private static uint GetBufferDataFormatElementBytes(uint dataFormat) =>
+            dataFormat switch
+            {
+                1 => 1,   // 8
+                2 => 2,   // 16
+                3 => 2,   // 8_8
+                4 => 4,   // 32
+                5 => 4,   // 16_16
+                6 or 7 or 8 or 9 or 10 => 4,
+                11 => 8,  // 32_32
+                12 => 8,  // 16_16_16_16
+                13 => 12, // 32_32_32
+                14 => 16, // 32_32_32_32
+                _ => 0,
+            };
+
+        private bool TryGetBufferBindingFormat(
+            int bindingIndex,
+            out uint dataFormat,
+            out uint numberFormat)
+        {
+            dataFormat = 0;
+            numberFormat = 0;
+            var relative = bindingIndex - _globalBufferBase;
+            if (relative < 0 || relative >= _evaluation.GlobalMemoryBindings.Count)
+            {
+                return false;
+            }
+
+            var binding = _evaluation.GlobalMemoryBindings[relative];
+            dataFormat = binding.DataFormat;
+            numberFormat = binding.NumberFormat;
+            return dataFormat != 0;
+        }
+
+        private bool TryEmitTypedFormatBufferStore(
+            int bindingIndex,
+            Gen5BufferMemoryControl control,
+            uint byteAddress)
+        {
+            if (!TryGetBufferBindingFormat(bindingIndex, out var dataFormat, out var numberFormat) ||
+                control.DwordCount == 0 ||
+                control.DwordCount > 4)
+            {
+                return false;
+            }
+
+            var components = new uint[control.DwordCount];
+            for (uint index = 0; index < control.DwordCount; index++)
+            {
+                components[index] = Bitcast(_floatType, LoadV(control.VectorData + index));
+            }
+
+            // BUF_NUM_FORMAT_FLOAT
+            if (numberFormat == 7)
+            {
+                return TryStoreFloatBufferFormat(
+                    bindingIndex,
+                    byteAddress,
+                    dataFormat,
+                    components);
+            }
+
+            // BUF_NUM_FORMAT_UINT / SINT on 32-bit lanes: hardware still takes float
+            // VGPRs, but 32-bit FORMAT stores are bit-preserving in practice for this
+            // path (userdata often carries pre-packed f16 pairs in 32-bit slots).
+            // Narrower integer formats are uncommon here; fall back to raw if needed.
+            if (numberFormat is 4 or 5 && dataFormat is 4 or 11 or 13 or 14)
+            {
+                return TryStoreFloatBufferFormat(
+                    bindingIndex,
+                    byteAddress,
+                    dataFormat,
+                    components);
+            }
+
+            if (numberFormat is 4 or 5)
+            {
+                return TryStoreIntBufferFormat(
+                    bindingIndex,
+                    byteAddress,
+                    dataFormat,
+                    numberFormat,
+                    components);
+            }
+
+            // BUF_NUM_FORMAT_UNORM / SRGB
+            if (numberFormat is 0 or 9 && dataFormat is 1 or 3 or 10)
+            {
+                return TryStoreUnormBufferFormat(
+                    bindingIndex,
+                    byteAddress,
+                    dataFormat,
+                    components);
+            }
+
+            return false;
+        }
+
+        private bool TryStoreIntBufferFormat(
+            int bindingIndex,
+            uint byteAddress,
+            uint dataFormat,
+            uint numberFormat,
+            uint[] components)
+        {
+            var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+            var toInt = numberFormat == 5; // SINT
+            uint ConvertComponent(uint value) =>
+                toInt
+                    ? Bitcast(
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.ConvertFToS, _intType, value))
+                    : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, value);
+
+            // Packed 8/16 integer formats are uncommon for this path; handle 32-bit lanes.
+            if (dataFormat is 4 or 11 or 13 or 14)
+            {
+                for (uint index = 0; index < components.Length; index++)
+                {
+                    StoreBufferWord(
+                        bindingIndex,
+                        index == 0 ? dwordAddress : IAdd(dwordAddress, UInt(index)),
+                        ConvertComponent(components[index]));
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryStoreFloatBufferFormat(
+            int bindingIndex,
+            uint byteAddress,
+            uint dataFormat,
+            uint[] components)
+        {
+            var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+            switch (dataFormat)
+            {
+                case 4:  // 32
+                case 11: // 32_32
+                case 13: // 32_32_32
+                case 14: // 32_32_32_32
+                    for (uint index = 0; index < components.Length; index++)
+                    {
+                        StoreBufferWord(
+                            bindingIndex,
+                            index == 0 ? dwordAddress : IAdd(dwordAddress, UInt(index)),
+                            Bitcast(_uintType, components[index]));
+                    }
+
+                    return true;
+
+                case 2: // 16
+                {
+                    var packed = PackFloatToHalfBits(components[0]);
+                    StoreBufferWord(bindingIndex, dwordAddress, packed);
+                    return true;
+                }
+
+                case 5: // 16_16
+                {
+                    var second = components.Length > 1 ? components[1] : Float(0);
+                    StoreBufferWord(
+                        bindingIndex,
+                        dwordAddress,
+                        PackHalf2x16(components[0], second));
+                    return true;
+                }
+
+                case 12: // 16_16_16_16
+                {
+                    var c0 = components[0];
+                    var c1 = components.Length > 1 ? components[1] : Float(0);
+                    var c2 = components.Length > 2 ? components[2] : Float(0);
+                    var c3 = components.Length > 3 ? components[3] : Float(0);
+                    StoreBufferWord(bindingIndex, dwordAddress, PackHalf2x16(c0, c1));
+                    if (components.Length > 2)
+                    {
+                        StoreBufferWord(
+                            bindingIndex,
+                            IAdd(dwordAddress, UInt(1)),
+                            PackHalf2x16(c2, c3));
+                    }
+
+                    return true;
+                }
+
+                default:
+                    return false;
+            }
+        }
+
+        private bool TryStoreUnormBufferFormat(
+            int bindingIndex,
+            uint byteAddress,
+            uint dataFormat,
+            uint[] components)
+        {
+            var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+
+            switch (dataFormat)
+            {
+                case 1: // 8
+                    StoreBufferWord(
+                        bindingIndex,
+                        dwordAddress,
+                        PackUnorm8Component(components[0]));
+                    return true;
+
+                case 3: // 8_8
+                {
+                    var lo = PackUnorm8Component(components[0]);
+                    var hi = components.Length > 1
+                        ? PackUnorm8Component(components[1])
+                        : UInt(0);
+                    StoreBufferWord(
+                        bindingIndex,
+                        dwordAddress,
+                        BitwiseOr(lo, ShiftLeftLogical(hi, UInt(8))));
+                    return true;
+                }
+
+                case 10: // 8_8_8_8
+                {
+                    uint packed = UInt(0);
+                    for (uint index = 0; index < components.Length; index++)
+                    {
+                        packed = BitwiseOr(
+                            packed,
+                            ShiftLeftLogical(
+                                PackUnorm8Component(components[index]),
+                                UInt(index * 8)));
+                    }
+
+                    StoreBufferWord(bindingIndex, dwordAddress, packed);
+                    return true;
+                }
+
+                default:
+                    return false;
+            }
+        }
+
+        private uint PackUnorm8Component(uint value)
+        {
+            var clamped = Ext(43, _floatType, value, Float(0), Float(1));
+            var scaled = _module.AddInstruction(
+                SpirvOp.FMul,
+                _floatType,
+                clamped,
+                Float(255));
+            return _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, scaled);
+        }
+
+        private uint PackHalf2x16(uint first, uint second)
+        {
+            var vector = _module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                _vec2Type,
+                TruncateFloat32ForPack(first),
+                TruncateFloat32ForPack(second));
+            return Ext(58, _uintType, vector);
+        }
+
+        private uint PackFloatToHalfBits(uint value)
+        {
+            var packed = PackHalf2x16(value, Float(0));
+            return BitwiseAnd(packed, UInt(0xFFFF));
+        }
 
         private bool TryEmitVertexInputFetch(
             Gen5BufferMemoryControl control,

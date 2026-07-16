@@ -213,12 +213,16 @@ internal static class Gen5ShaderScalarEvaluator
                 }
 
                 var key = (globalMemory.ScalarAddress, baseAddress);
+                var writable = IsWritableMemoryOpcode(instruction.Opcode);
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
-                    if (existingBinding.InstructionPcs is List<uint> instructionPcs)
-                    {
-                        instructionPcs.Add(instruction.Pc);
-                    }
+                    NoteExistingGlobalMemoryBinding(
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        key,
+                        existingBinding,
+                        instruction.Pc,
+                        writable);
                 }
                 else
                 {
@@ -235,7 +239,8 @@ internal static class Gen5ShaderScalarEvaluator
                         globalMemory.ScalarAddress,
                         baseAddress,
                         new List<uint> { instruction.Pc },
-                        data);
+                        data,
+                        writable);
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -326,12 +331,16 @@ internal static class Gen5ShaderScalarEvaluator
                 }
 
                 var key = (bufferMemory.ScalarResource, bufferDescriptor.BaseAddress);
+                var writable = IsWritableMemoryOpcode(instruction.Opcode);
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
-                    if (existingBinding.InstructionPcs is List<uint> instructionPcs)
-                    {
-                        instructionPcs.Add(instruction.Pc);
-                    }
+                    NoteExistingGlobalMemoryBinding(
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        key,
+                        existingBinding,
+                        instruction.Pc,
+                        writable);
                 }
                 else
                 {
@@ -358,7 +367,10 @@ internal static class Gen5ShaderScalarEvaluator
                         bufferMemory.ScalarResource,
                         bufferDescriptor.BaseAddress,
                         new List<uint> { instruction.Pc },
-                        data);
+                        data,
+                        writable,
+                        bufferDescriptor.DataFormat,
+                        bufferDescriptor.NumberFormat);
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -757,6 +769,37 @@ internal static class Gen5ShaderScalarEvaluator
     internal static void EndGlobalMemoryReadScope()
     {
         _globalMemoryReadCache = null;
+    }
+
+    private static bool IsWritableMemoryOpcode(string opcode) =>
+        opcode.Contains("Store", StringComparison.Ordinal) ||
+        opcode.Contains("Atomic", StringComparison.Ordinal);
+
+    private static void NoteExistingGlobalMemoryBinding(
+        List<Gen5GlobalMemoryBinding> globalMemoryBindings,
+        Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
+        (uint ScalarAddress, ulong BaseAddress) key,
+        Gen5GlobalMemoryBinding existingBinding,
+        uint instructionPc,
+        bool writable)
+    {
+        if (existingBinding.InstructionPcs is List<uint> instructionPcs)
+        {
+            instructionPcs.Add(instructionPc);
+        }
+
+        if (!writable || existingBinding.Writable)
+        {
+            return;
+        }
+
+        var updated = existingBinding with { Writable = true };
+        globalMemoryByAddress[key] = updated;
+        var index = globalMemoryBindings.IndexOf(existingBinding);
+        if (index >= 0)
+        {
+            globalMemoryBindings[index] = updated;
+        }
     }
 
     private static bool TryReadGlobalMemory(
@@ -1593,12 +1636,25 @@ internal static class Gen5ShaderScalarEvaluator
             var key = (scalarBase.Value, bufferDescriptor.BaseAddress);
             if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
             {
-                if (existingBinding.InstructionPcs is List<uint> instructionPcs) instructionPcs.Add(instruction.Pc);
+                NoteExistingGlobalMemoryBinding(
+                    globalMemoryBindings,
+                    globalMemoryByAddress,
+                    key,
+                    existingBinding,
+                    instruction.Pc,
+                    writable: false);
             }
             else
             {
                 TryReadGlobalMemory(ctx, bufferDescriptor.BaseAddress, bufferDescriptor.SizeBytes, out var data);
-                var binding = new Gen5GlobalMemoryBinding(scalarBase.Value, bufferDescriptor.BaseAddress, new List<uint> { instruction.Pc }, data);
+                var binding = new Gen5GlobalMemoryBinding(
+                    scalarBase.Value,
+                    bufferDescriptor.BaseAddress,
+                    new List<uint> { instruction.Pc },
+                    data,
+                    Writable: false,
+                    bufferDescriptor.DataFormat,
+                    bufferDescriptor.NumberFormat);
                 globalMemoryByAddress.Add(key, binding);
                 globalMemoryBindings.Add(binding);
             }
@@ -1608,10 +1664,13 @@ internal static class Gen5ShaderScalarEvaluator
             var key = (scalarBase.Value, baseAddress);
             if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
             {
-                if (existingBinding.InstructionPcs is List<uint> instructionPcs)
-                {
-                    instructionPcs.Add(instruction.Pc);
-                }
+                NoteExistingGlobalMemoryBinding(
+                    globalMemoryBindings,
+                    globalMemoryByAddress,
+                    key,
+                    existingBinding,
+                    instruction.Pc,
+                    writable: false);
             }
             else
             {
