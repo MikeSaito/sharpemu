@@ -105,6 +105,63 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextDestroy(CpuContext ctx) => ctx.SetReturn(0);
 
     [SysAbiExport(
+        Nid = "PE2zHMqLSHs",
+        ExportName = "sceAudioOut2ContextAdvance",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextAdvance(CpuContext ctx)
+    {
+        var contextHandle = ctx[CpuRegister.Rdi];
+        if (contextHandle == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "aII9h5nli9U",
+        ExportName = "sceAudioOut2ContextPush",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextPush(CpuContext ctx)
+    {
+        var contextHandle = ctx[CpuRegister.Rdi];
+        if (contextHandle == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "R7d0F1g2qsU",
+        ExportName = "sceAudioOut2ContextGetQueueLevel",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
+    {
+        var contextHandle = ctx[CpuRegister.Rdi];
+        var queuedAddress = ctx[CpuRegister.Rsi];
+        var availableAddress = ctx[CpuRegister.Rdx];
+        if (contextHandle == 0 || queuedAddress == 0 || availableAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // Report an empty queue so guests that spin until level==0 can proceed.
+        // Leave available as a positive capacity so "wait for room" polls also exit.
+        if (!ctx.TryWriteInt32(queuedAddress, 0) || !ctx.TryWriteInt32(availableAddress, 0x400))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "JK2wamZPzwM",
         ExportName = "sceAudioOut2PortCreate",
         Target = Generation.Gen5,
