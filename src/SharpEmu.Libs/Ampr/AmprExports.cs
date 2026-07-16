@@ -316,7 +316,10 @@ public static class AmprExports
 
         if (!AppendReadFileRecord(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead))
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            // Bytes are already in guest memory. Command-buffer bookkeeping can fail
+            // when the backing store is unset/full; treat that as a soft skip so
+            // sync APR readers (AprFile) are not failed with MEMORY_FAULT.
+            TraceAmpr(ctx, "read_file_append_skip", commandBuffer, destination, bytesRead);
         }
 
         TraceAmprRead(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead, hostPath, (int)OrbisGen2Result.ORBIS_GEN2_OK);
@@ -380,6 +383,27 @@ public static class AmprExports
 
         TraceAmpr(ctx, "get_size", commandBuffer, size, 0);
         ctx[CpuRegister.Rax] = size;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "gzndltBEzWc",
+        ExportName = "sceAmprCommandBufferGetNumCommands",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAmpr")]
+    public static int CommandBufferGetNumCommands(CpuContext ctx)
+    {
+        var commandBuffer = ctx[CpuRegister.Rdi];
+        if (commandBuffer == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        // Same ABI as GetSize/GetCurrentOffset: count in RAX. Observed call-site
+        // rsi/rdx are leftover registers, not out-params — do not write them.
+        // Report empty/drained so poll-until-zero callers can proceed.
+        TraceAmpr(ctx, "get_num_commands", commandBuffer, 0, 0);
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
