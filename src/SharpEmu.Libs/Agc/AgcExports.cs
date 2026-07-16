@@ -6,6 +6,7 @@ using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace SharpEmu.Libs.Agc;
 
@@ -135,6 +136,16 @@ public static class AgcExports
     private const ulong ShaderNumOutputSemanticsOffset = 0x56;
     private const ulong ShaderTypeOffset = 0x5A;
     private const ulong ShaderNumShRegistersOffset = 0x5C;
+    // SizeAlign: [+0]=size (u64), [+8]=log2(align) (byte); caller does rdx = 1 << al.
+    private const ulong SizeAlignSizeOffset = 0x00;
+    private const ulong SizeAlignAlignLog2Offset = 0x08;
+    private const byte FusedShaderAlignLog2 = 8; // 256-byte alignment
+    private const ulong FusedShaderHeaderBudget = 0x100;
+    private const ulong FusedShaderCodeBudgetPerHalf = 0x8000;
+    private const ulong FusedShaderMergeExtra = 0x400;
+    private const uint FusedShaderHeaderBytes = 0x100;
+    private const uint FusedShaderMaxCodeCopyPerHalf = 0x4000;
+    private const ulong FusedShaderMaxOrderedSpan = 0x10_0000;
     private const ulong CommandBufferCursorUpOffset = 0x10;
     private const ulong CommandBufferCursorDownOffset = 0x18;
     private const ulong CommandBufferCallbackOffset = 0x20;
@@ -180,6 +191,9 @@ public static class AgcExports
     private static long _dcbWriteDataTraceCount;
     private static long _dcbWaitRegMemTraceCount;
     private static long _createShaderTraceCount;
+    private static long _getFusedShaderSizeTraceCount;
+    private static long _fuseShaderHalvesTraceCount;
+    private static ulong _lastFusedShaderSizeAlign;
     private static long _packetPayloadTraceCount;
     private static bool _tracedMissingPixelShaderBindings;
     private static long _shaderTranslationMissTraceCount;
@@ -525,6 +539,136 @@ public static class AgcExports
         }
 
         TraceCreateShader(destinationAddress, headerAddress, codeAddress, "ok");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "dolOmWH+huQ",
+        ExportName = "sceAgcGetFusedShaderSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetFusedShaderSize(CpuContext ctx)
+    {
+        var sizeAlignAddress = ctx[CpuRegister.Rdi];
+        var shaderAAddress = ctx[CpuRegister.Rsi];
+        var shaderBAddress = ctx[CpuRegister.Rdx];
+        if (sizeAlignAddress == 0 || shaderAAddress == 0 || shaderBAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryEstimateFusedShaderSize(
+                ctx,
+                shaderAAddress,
+                shaderBAddress,
+                out var size,
+                out var alignLog2,
+                out var detail))
+        {
+            TraceGetFusedShaderSize(
+                sizeAlignAddress,
+                shaderAAddress,
+                shaderBAddress,
+                0,
+                0,
+                detail);
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!ctx.TryWriteUInt64(sizeAlignAddress + SizeAlignSizeOffset, size) ||
+            !ctx.TryWriteUInt32(sizeAlignAddress + SizeAlignAlignLog2Offset, alignLog2))
+        {
+            TraceGetFusedShaderSize(
+                sizeAlignAddress,
+                shaderAAddress,
+                shaderBAddress,
+                size,
+                alignLog2,
+                "write-failed");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        Volatile.Write(ref _lastFusedShaderSizeAlign, size);
+        TraceGetFusedShaderSize(
+            sizeAlignAddress,
+            shaderAAddress,
+            shaderBAddress,
+            size,
+            alignLog2,
+            $"ok {detail}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "fd5Bp5tGTgo",
+        ExportName = "sceAgcFuseShaderHalves",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int FuseShaderHalves(CpuContext ctx)
+    {
+        var destinationAddress = ctx[CpuRegister.Rdi];
+        var shaderAAddress = ctx[CpuRegister.Rsi];
+        var shaderBAddress = ctx[CpuRegister.Rdx];
+        var scratchAddress = ctx[CpuRegister.Rcx];
+        if (destinationAddress == 0 || shaderAAddress == 0 || shaderBAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        string? detailA = null;
+        string? detailB = null;
+        if (!TryValidateShaderHeader(ctx, shaderAAddress, out detailA) ||
+            !TryValidateShaderHeader(ctx, shaderBAddress, out detailB))
+        {
+            TraceFuseShaderHalves(
+                destinationAddress,
+                shaderAAddress,
+                shaderBAddress,
+                scratchAddress,
+                0,
+                Volatile.Read(ref _lastFusedShaderSizeAlign),
+                detailA ?? detailB ?? "invalid-half");
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryFuseShaderHalves(
+                ctx,
+                destinationAddress,
+                shaderAAddress,
+                shaderBAddress,
+                scratchAddress,
+                out var layoutBytes,
+                out var detail))
+        {
+            TraceFuseShaderHalves(
+                destinationAddress,
+                shaderAAddress,
+                shaderBAddress,
+                scratchAddress,
+                layoutBytes,
+                Volatile.Read(ref _lastFusedShaderSizeAlign),
+                detail);
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var lastSize = Volatile.Read(ref _lastFusedShaderSizeAlign);
+        var sizeNote = lastSize == 0
+            ? "size_align=unknown"
+            : layoutBytes > lastSize
+                ? $"size_align=0x{lastSize:X}-tight"
+                : $"size_align=0x{lastSize:X}-ok";
+        TraceFuseShaderHalves(
+            destinationAddress,
+            shaderAAddress,
+            shaderBAddress,
+            scratchAddress,
+            layoutBytes,
+            lastSize,
+            $"{detail} {sizeNote}");
+        // Return 0 (ORBIS_OK). Call-site clears dest+0x08 when eax != 0x8A6C0008;
+        // do not invent that constant as success without evidence.
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -6236,6 +6380,357 @@ public static class AgcExports
 
         Console.Error.WriteLine(
             $"[LOADER][TRACE] agc.create_shader dst=0x{destinationAddress:X16} header=0x{headerAddress:X16} code=0x{codeAddress:X16} {detail}");
+    }
+
+    private static bool TryValidateShaderHeader(CpuContext ctx, ulong headerAddress, out string? detail)
+    {
+        detail = null;
+        if (!ctx.TryReadUInt32(headerAddress, out var fileHeader) ||
+            !ctx.TryReadUInt32(headerAddress + sizeof(uint), out var version))
+        {
+            detail = "header-unreadable";
+            return false;
+        }
+
+        if (fileHeader != ShaderFileHeader || version != ShaderVersion)
+        {
+            detail = $"invalid-header file=0x{fileHeader:X8} version=0x{version:X8}";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryEstimateFusedShaderSize(
+        CpuContext ctx,
+        ulong shaderAAddress,
+        ulong shaderBAddress,
+        out ulong size,
+        out uint alignLog2,
+        out string detail)
+    {
+        size = 0;
+        alignLog2 = FusedShaderAlignLog2;
+        if (!TryValidateShaderHeader(ctx, shaderAAddress, out var detailA))
+        {
+            detail = detailA ?? "invalid-a";
+            return false;
+        }
+
+        if (!TryValidateShaderHeader(ctx, shaderBAddress, out var detailB))
+        {
+            detail = detailB ?? "invalid-b";
+            return false;
+        }
+
+        var sizeA = EstimateShaderHalfBytes(ctx, shaderAAddress);
+        var sizeB = EstimateShaderHalfBytes(ctx, shaderBAddress);
+        var orderedSpan = 0UL;
+        // Astro packs halves back-to-back in GPU VA; B-A is a lower bound for A's blob.
+        if (shaderBAddress > shaderAAddress)
+        {
+            var gap = shaderBAddress - shaderAAddress;
+            if (gap <= FusedShaderMaxOrderedSpan)
+            {
+                orderedSpan = gap;
+                if (gap > sizeA)
+                {
+                    sizeA = gap;
+                }
+            }
+        }
+
+        size = sizeA + sizeB + FusedShaderMergeExtra + (FusedShaderHeaderBytes * 2UL);
+        if (size < FusedShaderHeaderBudget)
+        {
+            size = FusedShaderHeaderBudget;
+        }
+
+        detail = orderedSpan == 0
+            ? $"a=0x{sizeA:X} b=0x{sizeB:X}"
+            : $"a=0x{sizeA:X} b=0x{sizeB:X} ordered_gap=0x{orderedSpan:X}";
+        return true;
+    }
+
+    private static ulong EstimateShaderHalfBytes(CpuContext ctx, ulong headerAddress)
+    {
+        var bytes = FusedShaderHeaderBudget;
+        if (ctx.TryReadUInt64(headerAddress + ShaderCodeOffset, out var codeAddress) &&
+            codeAddress != 0)
+        {
+            bytes += FusedShaderCodeBudgetPerHalf;
+        }
+        else
+        {
+            bytes += FusedShaderCodeBudgetPerHalf / 2;
+        }
+
+        return bytes;
+    }
+
+    private static bool TryFuseShaderHalves(
+        CpuContext ctx,
+        ulong destinationAddress,
+        ulong shaderAAddress,
+        ulong shaderBAddress,
+        ulong scratchAddress,
+        out ulong layoutBytes,
+        out string detail)
+    {
+        layoutBytes = 0;
+        detail = "fuse-failed";
+
+        _ = ctx.TryReadByte(shaderAAddress + ShaderTypeOffset, out var typeA);
+        _ = ctx.TryReadByte(shaderBAddress + ShaderTypeOffset, out var typeB);
+
+        // Dest Shader header starts as half-A (CreateShader field layout).
+        if (!TryCopyGuestMemory(ctx, shaderAAddress, destinationAddress, FusedShaderHeaderBytes))
+        {
+            detail = "dest-copy-a-failed";
+            return false;
+        }
+
+        MergeShaderHeaderFieldsFromHalf(ctx, destinationAddress, shaderBAddress, typeA, typeB);
+
+        if (scratchAddress == 0)
+        {
+            layoutBytes = FusedShaderHeaderBytes;
+            detail = $"ok-noscratch type_a={typeA} type_b={typeB}";
+            return TryValidateShaderHeader(ctx, destinationAddress, out _);
+        }
+
+        // Scratch layout (caller-provided GPU working buffer):
+        //   +0x000: header mirror A
+        //   +0x100: header mirror B
+        //   +0x200: code bytes from A (capped)
+        //   +0x200+codeA: code bytes from B (capped)
+        var scratchHeaderA = scratchAddress;
+        var scratchHeaderB = scratchAddress + FusedShaderHeaderBytes;
+        var scratchCode = scratchAddress + (FusedShaderHeaderBytes * 2UL);
+        var lastSize = Volatile.Read(ref _lastFusedShaderSizeAlign);
+        var scratchBudget = lastSize == 0
+            ? (FusedShaderHeaderBytes * 2UL) + (FusedShaderMaxCodeCopyPerHalf * 2UL)
+            : lastSize;
+
+        if (scratchBudget < FusedShaderHeaderBytes * 2UL)
+        {
+            detail = $"scratch-too-small size_align=0x{lastSize:X}";
+            return false;
+        }
+
+        if (!TryCopyGuestMemory(ctx, shaderAAddress, scratchHeaderA, FusedShaderHeaderBytes) ||
+            !TryCopyGuestMemory(ctx, shaderBAddress, scratchHeaderB, FusedShaderHeaderBytes))
+        {
+            detail = "scratch-header-copy-failed";
+            return false;
+        }
+
+        var codeBudget = scratchBudget - (FusedShaderHeaderBytes * 2UL);
+        var codeBudgetA = (uint)Math.Min(FusedShaderMaxCodeCopyPerHalf, codeBudget / 2);
+        var codeBudgetB = (uint)Math.Min(FusedShaderMaxCodeCopyPerHalf, codeBudget - codeBudgetA);
+
+        var codeBytesA = TryCopyShaderCode(ctx, shaderAAddress, scratchCode, codeBudgetA, out var copiedA);
+        var codeBytesB = TryCopyShaderCode(
+            ctx,
+            shaderBAddress,
+            scratchCode + codeBytesA,
+            codeBudgetB,
+            out var copiedB);
+
+        layoutBytes = (FusedShaderHeaderBytes * 2UL) + codeBytesA + codeBytesB;
+
+        // Retarget only intra-header pointers into scratch mirrors (safe; does not mutate half blobs).
+        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderUserDataOffset, scratchHeaderA, shaderAAddress);
+        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderCxRegistersOffset, scratchHeaderA, shaderAAddress);
+        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderShRegistersOffset, scratchHeaderA, shaderAAddress);
+        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderSpecialsOffset, scratchHeaderA, shaderAAddress);
+        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderOutputSemanticsOffset, scratchHeaderA, shaderAAddress);
+        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderInputSemanticsOffset, scratchHeaderB, shaderBAddress);
+
+        // Point dest code at scratch code when we actually mirrored it. Do NOT patch SH
+        // program registers here — those tables usually live outside the 0x100 header and
+        // PatchShaderProgramRegisters would mutate the source half in place.
+        if (copiedA)
+        {
+            if (!ctx.TryWriteUInt64(destinationAddress + ShaderCodeOffset, scratchCode))
+            {
+                detail = "dest-code-write-failed";
+                return false;
+            }
+        }
+        else if (copiedB)
+        {
+            if (!ctx.TryWriteUInt64(destinationAddress + ShaderCodeOffset, scratchCode + codeBytesA))
+            {
+                detail = "dest-code-b-write-failed";
+                return false;
+            }
+        }
+
+        if (!TryValidateShaderHeader(ctx, destinationAddress, out var destDetail))
+        {
+            detail = destDetail ?? "dest-header-corrupt";
+            return false;
+        }
+
+        var tight = lastSize != 0 && layoutBytes > lastSize ? " overflow" : "";
+        detail =
+            $"ok-scratch type_a={typeA} type_b={typeB} " +
+            $"code_a=0x{codeBytesA:X}{(copiedA ? "" : "/skip")} " +
+            $"code_b=0x{codeBytesB:X}{(copiedB ? "" : "/skip")} " +
+            $"layout=0x{layoutBytes:X}{tight}";
+        return true;
+    }
+
+    private static void MergeShaderHeaderFieldsFromHalf(
+        CpuContext ctx,
+        ulong destinationAddress,
+        ulong halfBAddress,
+        byte typeA,
+        byte typeB)
+    {
+        // Pixel half (type 1) typically owns input semantics; geometry/ES owns outputs.
+        var preferBInputs = typeB == 1 || (typeA != 1 && typeB != 0);
+        var preferBOutputs = IsEsGeometryShaderType(typeB) && !IsEsGeometryShaderType(typeA);
+
+        if (preferBInputs)
+        {
+            if (ctx.TryReadUInt64(halfBAddress + ShaderInputSemanticsOffset, out var inputs) &&
+                inputs != 0)
+            {
+                _ = ctx.TryWriteUInt64(destinationAddress + ShaderInputSemanticsOffset, inputs);
+            }
+
+            if (ctx.TryReadUInt32(halfBAddress + ShaderNumInputSemanticsOffset, out var numIn))
+            {
+                _ = ctx.TryWriteUInt32(destinationAddress + ShaderNumInputSemanticsOffset, numIn);
+            }
+        }
+
+        if (preferBOutputs)
+        {
+            if (ctx.TryReadUInt64(halfBAddress + ShaderOutputSemanticsOffset, out var outputs) &&
+                outputs != 0)
+            {
+                _ = ctx.TryWriteUInt64(destinationAddress + ShaderOutputSemanticsOffset, outputs);
+            }
+
+            if (ctx.TryReadUInt16(halfBAddress + ShaderNumOutputSemanticsOffset, out var numOut))
+            {
+                _ = ctx.TryWriteUInt16(destinationAddress + ShaderNumOutputSemanticsOffset, numOut);
+            }
+        }
+
+        // If dest userData was cleared by a prior failed fuse path, adopt B's when present.
+        if (ctx.TryReadUInt64(destinationAddress + ShaderUserDataOffset, out var userData) &&
+            userData == 0 &&
+            ctx.TryReadUInt64(halfBAddress + ShaderUserDataOffset, out var userDataB) &&
+            userDataB != 0)
+        {
+            _ = ctx.TryWriteUInt64(destinationAddress + ShaderUserDataOffset, userDataB);
+        }
+    }
+
+    private static uint TryCopyShaderCode(
+        CpuContext ctx,
+        ulong headerAddress,
+        ulong destinationAddress,
+        uint maxBytes,
+        out bool copied)
+    {
+        copied = false;
+        if (maxBytes == 0 ||
+            !ctx.TryReadUInt64(headerAddress + ShaderCodeOffset, out var codeAddress) ||
+            codeAddress == 0)
+        {
+            return 0;
+        }
+
+        if (!ctx.TryReadUInt32(codeAddress, out _))
+        {
+            return 0;
+        }
+
+        var byteCount = maxBytes;
+        if (!TryCopyGuestMemory(ctx, codeAddress, destinationAddress, byteCount))
+        {
+            byteCount = Math.Min(maxBytes, 0x400u);
+            if (byteCount == 0 ||
+                !TryCopyGuestMemory(ctx, codeAddress, destinationAddress, byteCount))
+            {
+                return 0;
+            }
+        }
+
+        copied = true;
+        return byteCount;
+    }
+
+    private static bool TryRetargetPointerField(
+        CpuContext ctx,
+        ulong fieldAddress,
+        ulong scratchHeaderAddress,
+        ulong originalHeaderAddress)
+    {
+        if (!ctx.TryReadUInt64(fieldAddress, out var value) || value == 0)
+        {
+            return true;
+        }
+
+        // Only retarget pointers that still live inside the original half header window.
+        if (value < originalHeaderAddress ||
+            value >= originalHeaderAddress + FusedShaderHeaderBytes)
+        {
+            return true;
+        }
+
+        var offset = value - originalHeaderAddress;
+        return ctx.TryWriteUInt64(fieldAddress, scratchHeaderAddress + offset);
+    }
+
+    private static void TraceGetFusedShaderSize(
+        ulong sizeAlignAddress,
+        ulong shaderAAddress,
+        ulong shaderBAddress,
+        ulong size,
+        uint alignLog2,
+        string detail)
+    {
+        var isOk = detail.StartsWith("ok", StringComparison.Ordinal);
+        if (isOk &&
+            (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal) ||
+             !ShouldTraceHotPath(ref _getFusedShaderSizeTraceCount)))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.get_fused_shader_size out=0x{sizeAlignAddress:X16} " +
+            $"a=0x{shaderAAddress:X16} b=0x{shaderBAddress:X16} " +
+            $"size=0x{size:X} align_log2={alignLog2} {detail}");
+    }
+
+    private static void TraceFuseShaderHalves(
+        ulong destinationAddress,
+        ulong shaderAAddress,
+        ulong shaderBAddress,
+        ulong scratchAddress,
+        ulong layoutBytes,
+        ulong lastSizeAlign,
+        string detail)
+    {
+        var isOk = detail.StartsWith("ok", StringComparison.Ordinal);
+        if (isOk &&
+            (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal) ||
+             !ShouldTraceHotPath(ref _fuseShaderHalvesTraceCount)))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.fuse_shader_halves dst=0x{destinationAddress:X16} " +
+            $"a=0x{shaderAAddress:X16} b=0x{shaderBAddress:X16} scratch=0x{scratchAddress:X16} " +
+            $"layout=0x{layoutBytes:X} size_align=0x{lastSizeAlign:X} {detail}");
     }
 
     // Packet layouts mirror what DcbWaitRegMem emits.
