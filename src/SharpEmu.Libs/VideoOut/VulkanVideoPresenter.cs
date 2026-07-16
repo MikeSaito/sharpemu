@@ -1156,8 +1156,10 @@ internal static unsafe class VulkanVideoPresenter
             public VulkanGuestSampler SamplerState;
             public Sampler Sampler;
             public GuestImageResource? GuestImage;
+            public GuestImageResource? AliasSourceImage;
             public ulong CpuContentFingerprint;
             public bool UpdatesCpuContent;
+            public bool NeedsGpuConvert;
         }
 
         private sealed class GlobalBufferResource
@@ -3433,6 +3435,15 @@ internal static unsafe class VulkanVideoPresenter
                 var usedImageFormatView = false;
                 if (!IsCompatibleViewFormat(guestImage.Format, vkFormat))
                 {
+                    if (TryCreateTypedAliasTextureResource(
+                            texture,
+                            guestImage,
+                            vkFormat,
+                            out var typedAlias))
+                    {
+                        return typedAlias;
+                    }
+
                     // SRD view format can disagree with the last RT write (e.g. fmt36
                     // R8Unorm over a B10G11R11 bloom target). Prefer the published GPU
                     // image over a zero guest-RAM upload when content already exists.
@@ -3505,6 +3516,87 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             return CreateTextureResource(texture);
+        }
+
+        private bool TryCreateTypedAliasTextureResource(
+            VulkanGuestDrawTexture texture,
+            GuestImageResource guestImage,
+            Format requestedFormat,
+            out TextureResource resource)
+        {
+            resource = default!;
+            if (requestedFormat != Format.R8Unorm ||
+                guestImage.Format != Format.B10G11R11UfloatPack32 ||
+                guestImage.Width != texture.Width ||
+                guestImage.Height != texture.Height)
+            {
+                return false;
+            }
+
+            var width = Math.Max(texture.Width, 1);
+            var height = Math.Max(texture.Height, 1);
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                Flags = ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit,
+                ImageType = ImageType.Type2D,
+                Format = requestedFormat,
+                Extent = new Extent3D(width, height, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = SampleCountFlags.Count1Bit,
+                Tiling = ImageTiling.Optimal,
+                Usage = ImageUsageFlags.TransferDstBit |
+                        ImageUsageFlags.SampledBit |
+                        ImageUsageFlags.TransferSrcBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+            Check(_vk.CreateImage(_device, &imageInfo, null, out var image), "vkCreateImage(typed alias)");
+            _vk.GetImageMemoryRequirements(_device, image, out var imageRequirements);
+            var memoryInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = imageRequirements.Size,
+                MemoryTypeIndex = FindMemoryType(
+                    imageRequirements.MemoryTypeBits,
+                    MemoryPropertyFlags.DeviceLocalBit),
+            };
+            Check(_vk.AllocateMemory(_device, &memoryInfo, null, out var imageMemory), "vkAllocateMemory(typed alias)");
+            Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(typed alias)");
+
+            var viewInfo = new ImageViewCreateInfo
+            {
+                SType = StructureType.ImageViewCreateInfo,
+                Image = image,
+                ViewType = ImageViewType.Type2D,
+                Format = requestedFormat,
+                Components = ToVkComponentMapping(texture.DstSelect),
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(typed alias)");
+            var debugName = $"{TextureDebugName(texture, requestedFormat)} typed-alias";
+            SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
+            SetDebugName(ObjectType.ImageView, view.Handle, $"{debugName} view");
+            TraceVulkanShader(
+                $"vk.texture_typed_alias addr=0x{texture.Address:X16} " +
+                $"size={width}x{height} requested={requestedFormat} source={guestImage.Format}");
+            resource = new TextureResource
+            {
+                Address = texture.Address,
+                Image = image,
+                ImageMemory = imageMemory,
+                View = view,
+                Width = width,
+                Height = height,
+                RowLength = width,
+                DstSelect = texture.DstSelect,
+                OwnsStorage = true,
+                SamplerState = texture.Sampler,
+                AliasSourceImage = guestImage,
+                NeedsGpuConvert = true,
+            };
+            return true;
         }
 
         private bool TryCreateCpuTextureRefreshResource(
@@ -3601,8 +3693,8 @@ internal static unsafe class VulkanVideoPresenter
                 return CreateStorageScratchResource(texture);
             }
 
-            var guestImage = ResolveStorageGuestImage(texture);
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+            var guestImage = ResolveStorageGuestImage(texture);
             var view = GetOrCreateGuestImageView(
                 guestImage,
                 vkFormat,
@@ -6314,6 +6406,7 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8Unorm or
                 Format.R8Uint or
                 Format.R8Sint => 1,
+                Format.R8G8Unorm => 2,
                 Format.R32Uint or
                 Format.R32Sint or
                 Format.R32Sfloat or
@@ -6323,7 +6416,8 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8G8B8A8Uint or
                 Format.R8G8B8A8Sint or
                 Format.R8G8B8A8Unorm or
-                Format.A2R10G10B10UnormPack32 => 4,
+                Format.A2R10G10B10UnormPack32 or
+                Format.B10G11R11UfloatPack32 => 4,
                 Format.R16G16B16A16Uint or
                 Format.R16G16B16A16Sint or
                 Format.R16G16B16A16Sfloat => 8,
@@ -6349,6 +6443,10 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     Format.A2R10G10B10UnormPack32 =>
                         (BitConverter.ToUInt32(pixel) & 0x3FFFFFFFu) != 0,
+                    Format.B10G11R11UfloatPack32 =>
+                        (BitConverter.ToUInt32(pixel) & 0x3FFFFFFFu) != 0,
+                    Format.R8G8Unorm =>
+                        pixel[0] != 0 || pixel[1] != 0,
                     Format.R8G8B8A8Uint or
                     Format.R8G8B8A8Sint or
                     Format.R8G8B8A8Unorm =>
@@ -6385,6 +6483,12 @@ internal static unsafe class VulkanVideoPresenter
         {
             foreach (var texture in resources.Textures)
             {
+                if (texture.NeedsGpuConvert)
+                {
+                    RecordTypedAliasConversion(texture, shaderStage);
+                    continue;
+                }
+
                 if (!texture.NeedsUpload)
                 {
                     continue;
@@ -6466,6 +6570,125 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     &toShaderRead);
             }
+        }
+
+        private void RecordTypedAliasConversion(
+            TextureResource texture,
+            PipelineStageFlags shaderStage)
+        {
+            if (texture.AliasSourceImage is not { } sourceImage)
+            {
+                throw new InvalidOperationException("Typed alias texture has no source image.");
+            }
+
+            var sourceToTransfer = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderReadBit,
+                DstAccessMask = AccessFlags.TransferReadBit,
+                OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                NewLayout = ImageLayout.TransferSrcOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = sourceImage.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            var destinationToTransfer = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = 0,
+                DstAccessMask = AccessFlags.TransferWriteBit,
+                OldLayout = ImageLayout.Undefined,
+                NewLayout = ImageLayout.TransferDstOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = texture.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            var transferBarriers = stackalloc ImageMemoryBarrier[2];
+            transferBarriers[0] = sourceToTransfer;
+            transferBarriers[1] = destinationToTransfer;
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.AllCommandsBit,
+                PipelineStageFlags.TransferBit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                2,
+                transferBarriers);
+
+            var sourceOffsets = new ImageBlit.SrcOffsetsBuffer();
+            sourceOffsets.Element0 = new Offset3D(0, 0, 0);
+            sourceOffsets.Element1 = new Offset3D((int)sourceImage.Width, (int)sourceImage.Height, 1);
+            var destinationOffsets = new ImageBlit.DstOffsetsBuffer();
+            destinationOffsets.Element0 = new Offset3D(0, 0, 0);
+            destinationOffsets.Element1 = new Offset3D((int)texture.Width, (int)texture.Height, 1);
+            var region = new ImageBlit
+            {
+                SrcSubresource = new ImageSubresourceLayers
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    LayerCount = 1,
+                },
+                DstSubresource = new ImageSubresourceLayers
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    LayerCount = 1,
+                },
+                SrcOffsets = sourceOffsets,
+                DstOffsets = destinationOffsets,
+            };
+            _vk.CmdBlitImage(
+                _commandBuffer,
+                sourceImage.Image,
+                ImageLayout.TransferSrcOptimal,
+                texture.Image,
+                ImageLayout.TransferDstOptimal,
+                1,
+                &region,
+                Filter.Nearest);
+
+            var sourceToShaderRead = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferReadBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.TransferSrcOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = sourceImage.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            var destinationToShaderRead = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.TransferDstOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = texture.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            var shaderReadBarriers = stackalloc ImageMemoryBarrier[2];
+            shaderReadBarriers[0] = sourceToShaderRead;
+            shaderReadBarriers[1] = destinationToShaderRead;
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TransferBit,
+                shaderStage,
+                0,
+                0,
+                null,
+                0,
+                null,
+                2,
+                shaderReadBarriers);
         }
 
         private void RecordStorageImagesForWrite(
