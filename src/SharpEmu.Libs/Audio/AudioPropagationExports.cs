@@ -81,10 +81,13 @@ public static class AudioPropagationExports
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
-    // Astro guest pointers live in the low 4G arenas (stack ~0x0324…, heap
-    // ~0x0326…). Size/alignment immediates such as 0x10010 must not qualify.
+    // Astro guest pointers live in the low 4G arenas (stack ~0x0324..., heap
+    // ~0x0326...). Size/alignment immediates such as 0x10010 must not qualify.
     private static bool IsLikelyGuestPointer(ulong address) =>
         address >= 0x0100_0000UL && address < 0x0000_8000_0000_0000UL;
+
+    private static bool IsPlausibleGrainCount(uint value) =>
+        value is >= 64 and <= 8192;
 
     private static ulong ResolveOutPointer(CpuContext ctx, ulong candidate)
     {
@@ -99,9 +102,52 @@ public static class AudioPropagationExports
             return r8;
         }
 
-        // 4th/5th pointer often lives in the caller frame when RCX holds a
-        // size (Astro SystemCreate: rcx=0x10010) instead of an out address.
-        return ctx[CpuRegister.Rsp] + 0x20;
+        // Win64: [rsp]=ret, [rsp+8..0x20]=shadow, [rsp+0x28]=5th arg.
+        // Astro SystemCreate puts size in RCX (0x10010) and system* on the stack.
+        return ctx[CpuRegister.Rsp] + 0x28;
+    }
+
+    private static void WriteSystemOutCandidates(CpuContext ctx, ulong systemAddress, ulong primaryOut)
+    {
+        // Always stamp the resolved out slot — stack garbage can look like a
+        // guest pointer (Astro: [rsp+0x28]=0x300000020) and must be overwritten.
+        _ = ctx.TryWriteUInt64(primaryOut, systemAddress);
+
+        var rsp = ctx[CpuRegister.Rsp];
+        ReadOnlySpan<ulong> slots =
+        [
+            rsp + 0x28,
+            rsp + 0x20,
+            rsp + 0x08,
+            rsp + 0x30,
+        ];
+
+        foreach (var slot in slots)
+        {
+            if (slot == primaryOut || !IsLikelyGuestPointer(slot))
+            {
+                continue;
+            }
+
+            if (!ctx.TryReadUInt64(slot, out var existing))
+            {
+                continue;
+            }
+
+            if (existing == 0 || existing == systemAddress)
+            {
+                _ = ctx.TryWriteUInt64(slot, systemAddress);
+                continue;
+            }
+
+            // Slot holds &outLocal — write through when the pointee is empty.
+            if (IsLikelyGuestPointer(existing) &&
+                ctx.TryReadUInt64(existing, out var pointed) &&
+                (pointed == 0 || pointed == systemAddress))
+            {
+                _ = ctx.TryWriteUInt64(existing, systemAddress);
+            }
+        }
     }
 
     [SysAbiExport(
@@ -127,18 +173,38 @@ public static class AudioPropagationExports
             handle = 1;
         }
 
+        // Zero the guest-provided system arena. Uninitialized bytes were read
+        // as an absurd memset length right after Create.
+        var zeroArena = new byte[(int)SystemMemorySize];
+        _ = ctx.Memory.TryWrite(memoryAddress, zeroArena);
+
+        uint grainCount = 256;
+        if (ctx.TryReadUInt32(paramAddress + 0x20, out var paramGrain) &&
+            IsPlausibleGrainCount(paramGrain))
+        {
+            grainCount = paramGrain;
+        }
+
         Span<byte> header = stackalloc byte[SystemBlockSize];
         header.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(header, 0x41505250); // 'APRP'
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x08..], handle);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], paramAddress);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x18..], memoryInfoAddress);
-        if (!ctx.Memory.TryWrite(memoryAddress, header) ||
-            !ctx.TryWriteUInt64(systemOutAddress, memoryAddress))
+        // Astro post-Create compares numSamples to m_mergedRenderingResult
+        // .m_numOfGrains without calling SourceRender. Seed the soft header
+        // grain field(s) from SystemParam so the check can pass.
+        for (var offset = 0x20; offset <= 0x7C; offset += 4)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(header[offset..], grainCount);
+        }
+
+        if (!ctx.Memory.TryWrite(memoryAddress, header))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        WriteSystemOutCandidates(ctx, memoryAddress, systemOutAddress);
         return ctx.SetReturn(0);
     }
 
