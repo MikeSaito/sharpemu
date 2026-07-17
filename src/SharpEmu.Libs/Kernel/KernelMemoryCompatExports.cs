@@ -379,9 +379,10 @@ public static partial class KernelMemoryCompatExports
         const ulong MaxSane = 2UL * 1024 * 1024 * 1024;
         if (destination < 0x1000 || destination >= CanonicalUserUpper || length > MaxSane)
         {
-            Console.WriteLine("!!! CRITICAL: Bad Memset Call !!!");
-            Console.WriteLine($"Called from RIP: 0x{ctx.Rip:X}");
-            Console.WriteLine($"dst=0x{destination:X} val=0x{value:X2} len=0x{length:X}");
+            Console.Error.WriteLine(
+                $"[LOADER][WARNING] Bad Memset Call rip=0x{ctx.Rip:X16} " +
+                $"dst=0x{destination:X16} val=0x{value:X2} len=0x{length:X}");
+            ctx[CpuRegister.Rax] = destination;
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 

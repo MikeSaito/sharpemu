@@ -81,6 +81,27 @@ public static class AudioPropagationExports
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    private static bool IsLikelyGuestPointer(ulong address) =>
+        address >= 0x1_0000UL && address < 0x0000_8000_0000_0000UL;
+
+    private static ulong ResolveOutPointer(CpuContext ctx, ulong candidate)
+    {
+        if (IsLikelyGuestPointer(candidate))
+        {
+            return candidate;
+        }
+
+        var r8 = ctx[CpuRegister.R8];
+        if (IsLikelyGuestPointer(r8))
+        {
+            return r8;
+        }
+
+        // 4th/5th pointer often lives in the caller frame when RCX holds a
+        // size (Astro SystemCreate: rcx=0x10010) instead of an out address.
+        return ctx[CpuRegister.Rsp] + 0x20;
+    }
+
     [SysAbiExport(
         Nid = "aNEqtSHdUSo",
         ExportName = "sceAudioPropagationSystemCreate",
@@ -91,14 +112,9 @@ public static class AudioPropagationExports
         var paramAddress = ctx[CpuRegister.Rdi];
         var memoryInfoAddress = ctx[CpuRegister.Rsi];
         var memoryAddress = ctx[CpuRegister.Rdx];
-        var systemOutAddress = ctx[CpuRegister.Rcx];
-        if (systemOutAddress == 0)
-        {
-            // 4th pointer often lives in the caller frame when RCX is unused.
-            systemOutAddress = ctx[CpuRegister.Rsp] + 0x20;
-        }
+        var systemOutAddress = ResolveOutPointer(ctx, ctx[CpuRegister.Rcx]);
 
-        if (paramAddress == 0 || memoryAddress == 0)
+        if (paramAddress == 0 || memoryAddress == 0 || !IsLikelyGuestPointer(memoryAddress))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }

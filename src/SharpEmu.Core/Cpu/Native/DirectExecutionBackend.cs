@@ -1443,15 +1443,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0xF3, 0xA4,
 				0xC3,
 			],
-			"8zTFvBIAIN8" =>
-			[
-				0x49, 0x89, 0xF8,
-				0x48, 0x89, 0xF0,
-				0x48, 0x89, 0xD1,
-				0xF3, 0xAA,
-				0x4C, 0x89, 0xC0,
-				0xC3,
-			],
+			// memset (8zTFvBIAIN8) stays on the HLE path: the libc export clamps
+			// absurd lengths and inaccessible destinations. A raw rep stosb
+			// intrinsic AVs on lazy NOACCESS pages (SceSndzAudioOutMain) and
+			// bypasses that recovery.
 			_ => default,
 		};
 		if (code.IsEmpty)
@@ -1574,7 +1569,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool IsHlePreferredNid(string nid)
 	{
-		return string.Equals(nid, "QrZZdJ8XsX0", StringComparison.Ordinal);
+		return string.Equals(nid, "QrZZdJ8XsX0", StringComparison.Ordinal) ||
+			string.Equals(nid, "8zTFvBIAIN8", StringComparison.Ordinal);
 	}
 
 	private static bool IsLibcLibrary(string libraryName)
@@ -1678,9 +1674,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		return exportName switch
 		{
+			// memset stays HLE-only: guest often passes corrupt/absurd lengths
+			// (SceSndzAudioOutMain), and both host CRT and the old rep-stosb
+			// intrinsic AV on lazy NOACCESS pages instead of clamping.
 			"memcpy" or
 			"memmove" or
-			"memset" or
 			"memcmp" => true,
 			_ => false,
 		};

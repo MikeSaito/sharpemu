@@ -1323,6 +1323,39 @@ public sealed partial class DirectExecutionBackend
 			return true;
 		}
 
+		// Committed + PAGE_NOACCESS (or otherwise incompatible): common for
+		// large data arenas that were reserved/committed without usable rights.
+		// VirtualAlloc(MEM_COMMIT) will not upgrade protection here — reprotect.
+		if (mbi.State == 4096)
+		{
+			ulong reprotectSize = Math.Min(mbi.RegionSize, LazyCommitWindowBytes);
+			if (reprotectSize == 0)
+			{
+				reprotectSize = 4096uL;
+			}
+
+			reprotectSize &= 0xFFFFFFFFFFFFF000uL;
+			if (reprotectSize == 0)
+			{
+				reprotectSize = 4096uL;
+			}
+
+			if (TryReprotectRange(pageBase, reprotectSize, commitProtect) ||
+				TryReprotectRange(pageBase, 4096uL, commitProtect))
+			{
+				if (traceLazyCommit)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] lazy-reprotect#{traceIndex}: addr=0x{pageBase:X16} " +
+						$"size=0x{reprotectSize:X16} access={accessType} protect=0x{commitProtect:X8}");
+				}
+
+				return true;
+			}
+
+			return false;
+		}
+
 		bool committed = false;
 		ulong committedBase = 0;
 		ulong committedSize = 0;
@@ -1476,6 +1509,17 @@ public sealed partial class DirectExecutionBackend
 				return false;
 			}
 			return VirtualAlloc((void*)baseAddress, (nuint)length, 4096u, protection) != null;
+		}
+
+		static unsafe bool TryReprotectRange(ulong baseAddress, ulong length, uint protection)
+		{
+			if (length == 0)
+			{
+				return false;
+			}
+
+			uint oldProtect = 0;
+			return VirtualProtect((void*)baseAddress, (nuint)length, protection, &oldProtect);
 		}
 
 		static unsafe bool TryReserveRange(ulong baseAddress, ulong length)
