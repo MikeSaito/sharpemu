@@ -664,6 +664,27 @@ internal static unsafe class VulkanVideoPresenter
                     groupCountX,
                     groupCountY,
                     groupCountZ));
+
+            // Writable buffer CS must land in guest RAM before Agc snapshots the
+            // same address as a sampled texture (composite LUT 053803).
+            var needsPublishWait = false;
+            for (var index = 0; index < globalMemoryBuffers.Count; index++)
+            {
+                if (globalMemoryBuffers[index].PublishGuestMemory is not null)
+                {
+                    needsPublishWait = true;
+                    break;
+                }
+            }
+
+            if (needsPublishWait && _thread is not null)
+            {
+                var targetSequence = _enqueuedGuestWorkSequence;
+                while (!_closed && _completedGuestWorkSequence < targetSequence)
+                {
+                    System.Threading.Monitor.Wait(_gate, 8);
+                }
+            }
         }
 
         return true;
@@ -5211,11 +5232,35 @@ internal static unsafe class VulkanVideoPresenter
                         $"batch={batchIndex}/{batchCount} z={zStart}..{zStart + zCount}");
                     if (isLastBatch)
                     {
-                        SubmitGuestCommandBuffer(
-                            commandBuffer,
-                            resources,
-                            GetTraceImages(resources));
-                        submitted = true;
+                        // Buffer-only CS (LUT fills via MUBUF STORE_FORMAT) publish into
+                        // guest RAM that the next graphics draw snapshots as a texture.
+                        // Async pending writeback races Agc's texture_source read and the
+                        // composite sample (053803 was still zero at first 050741 draw).
+                        var needsImmediatePublish = false;
+                        foreach (var globalBuffer in resources.GlobalMemoryBuffers)
+                        {
+                            if (globalBuffer?.PublishGuestMemory is not null)
+                            {
+                                needsImmediatePublish = true;
+                                break;
+                            }
+                        }
+
+                        if (needsImmediatePublish)
+                        {
+                            SubmitGuestCommandBufferAndWait(commandBuffer);
+                            WriteBackGlobalMemoryBuffers(resources);
+                            commandBuffer = default;
+                            // Keep submitted=false so finally destroys resources after Mark*.
+                        }
+                        else
+                        {
+                            SubmitGuestCommandBuffer(
+                                commandBuffer,
+                                resources,
+                                GetTraceImages(resources));
+                            submitted = true;
+                        }
                     }
                     else
                     {
