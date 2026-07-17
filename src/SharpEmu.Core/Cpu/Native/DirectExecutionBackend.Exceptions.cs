@@ -482,7 +482,14 @@ public sealed partial class DirectExecutionBackend
 		var fontSoftAssertArmed = _softAssertInt41SiteSkipped;
 		ulong resumeRip = rip + 2;
 		var softAssertEpilogue = false;
+		// Only Font helper soft-asserts (Astro libSceFont call sites around
+		// 0x800EF****). Broader Result.cpp traps (e.g. AudioPropagation) must
+		// not be redirected once OpenFont armed this path.
+		const ulong fontSoftAssertLo = 0x0000000800EF0000UL;
+		const ulong fontSoftAssertHi = 0x0000000800EF8000UL;
+		var ripInFontSoftAssertBand = rip >= fontSoftAssertLo && rip < fontSoftAssertHi;
 		if (fontSoftAssertArmed &&
+			ripInFontSoftAssertBand &&
 			TryGetFontSoftAssertSuccessRip(rip, out var successRip))
 		{
 			softAssertEpilogue = true;
