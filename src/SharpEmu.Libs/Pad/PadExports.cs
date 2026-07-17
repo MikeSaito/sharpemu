@@ -36,8 +36,44 @@ public static class PadExports
     [ThreadStatic]
     private static PadState _cachedInputState;
 
+    [ThreadStatic]
+    private static bool _cachedFocused;
+
+    [ThreadStatic]
+    private static bool _cachedKeyboardArmed;
+
+    [ThreadStatic]
+    private static uint _cachedInjected;
+
     private static bool _initialized;
     private static int _controlsAnnouncementLogged;
+    private static long _padOpenedAtTicks;
+    private static int _padWriteCount;
+    private static uint _lastLoggedButtons = uint.MaxValue;
+    private static int _crossDeliveredLogged;
+
+    private static readonly bool LogPad =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD"), "1", StringComparison.Ordinal);
+
+    // Headless runs often leave the present window unfocused; keyboard Cross
+    // never reaches scePadRead unless this is set (or a controller is used).
+    private static readonly bool AllowUnfocusedKeyboard =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PAD_ALLOW_UNFOCUSED"),
+            "1",
+            StringComparison.Ordinal);
+
+    // Harness-only: pulse SCE_PAD_BUTTON_CROSS into scePadRead after open.
+    private static readonly bool InjectCross =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PAD_INJECT_CROSS"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static readonly int InjectAfterMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_AFTER_MS", 8_000);
+    private static readonly int InjectHoldMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_HOLD_MS", 400);
+    private static readonly int InjectGapMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_GAP_MS", 2_000);
+    private static readonly int InjectPulses = Math.Clamp(ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_PULSES", 3), 1, 32);
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -91,11 +127,27 @@ public static class PadExports
 
         var input = HostPlatform.Current.Input;
         input.EnsureStarted();
+        if (_padOpenedAtTicks == 0)
+        {
+            _padOpenedAtTicks = Stopwatch.GetTimestamp();
+        }
+
         if (Interlocked.Exchange(ref _controlsAnnouncementLogged, 1) == 0)
         {
             Console.Error.WriteLine(input.DescribeConnectedGamepad() is { } gamepadName
                 ? $"[LOADER][INFO] Controls: {gamepadName} connected (keyboard fallback also active)."
                 : "[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options. A DualSense or Xbox controller will be used automatically when plugged in.");
+            if (AllowUnfocusedKeyboard)
+            {
+                Console.Error.WriteLine("[LOADER][INFO] pad.keyboard_unfocused=1 (SHARPEMU_PAD_ALLOW_UNFOCUSED)");
+            }
+
+            if (InjectCross)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] pad.inject_cross=1 after_ms={InjectAfterMs} hold_ms={InjectHoldMs} " +
+                    $"gap_ms={InjectGapMs} pulses={InjectPulses}");
+            }
         }
 
         return ctx.SetReturn(PrimaryPadHandle);
@@ -235,7 +287,7 @@ public static class PadExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return WriteNeutralPadData(ctx, dataAddress)
+        return WriteNeutralPadData(ctx, dataAddress, "readState")
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -260,7 +312,7 @@ public static class PadExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return WriteNeutralPadData(ctx, dataAddress)
+        return WriteNeutralPadData(ctx, dataAddress, "read")
             ? ctx.SetReturn(1)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -396,11 +448,12 @@ public static class PadExports
         return ctx.SetReturn(0);
     }
 
-    private static bool WriteNeutralPadData(CpuContext ctx, ulong dataAddress)
+    private static bool WriteNeutralPadData(CpuContext ctx, ulong dataAddress, string api)
     {
         Span<byte> data = stackalloc byte[PadDataSize];
         data.Clear();
-        var input = ReadHostInputState();
+        var sample = ReadHostInputSample();
+        var input = sample.State;
         var buttons = input.Buttons;
         var leftX = input.LeftX;
         var leftY = input.LeftY;
@@ -427,19 +480,36 @@ public static class PadExports
             timestampMicroseconds);
         data[0x68] = 1;
 
-        return ctx.Memory.TryWrite(dataAddress, data);
+        if (!ctx.Memory.TryWrite(dataAddress, data))
+        {
+            return false;
+        }
+
+        TracePadWrite(api, sample);
+        return true;
     }
 
-    private static PadState ReadHostInputState()
+    private readonly record struct HostInputSample(
+        PadState State,
+        bool Focused,
+        bool KeyboardArmed,
+        uint Injected);
+
+    private static HostInputSample ReadHostInputSample()
     {
         var now = Stopwatch.GetTimestamp();
         if (_lastInputSampleTicks != 0 && now - _lastInputSampleTicks < InputSampleIntervalTicks)
         {
-            return _cachedInputState;
+            return new HostInputSample(
+                _cachedInputState,
+                _cachedFocused,
+                _cachedKeyboardArmed,
+                _cachedInjected);
         }
 
         var input = HostPlatform.Current.Input;
-        var acceptsKeyboardInput = input.IsHostWindowFocused();
+        var focused = input.IsHostWindowFocused();
+        var acceptsKeyboardInput = focused || AllowUnfocusedKeyboard;
         var buttons = acceptsKeyboardInput ? ReadKeyboardButtons(input) : 0;
         var leftX = acceptsKeyboardInput ? ReadAnalogStick(input.IsKeyDown(0x41), input.IsKeyDown(0x44)) : (byte)128;
         var leftY = acceptsKeyboardInput ? ReadAnalogStick(input.IsKeyDown(0x57), input.IsKeyDown(0x53)) : (byte)128;
@@ -466,8 +536,11 @@ public static class PadExports
 
         if (IsAutoCrossActive())
         {
-            buttons |= 0x4000;
+            buttons |= OrbisPadButton.Cross;
         }
+
+        var injected = ResolveInjectedButtons(now);
+        buttons |= injected;
 
         _cachedInputState = new PadState(
             Connected: true,
@@ -478,8 +551,15 @@ public static class PadExports
             RightY: rightY,
             L2: l2,
             R2: r2);
+        _cachedFocused = focused;
+        _cachedKeyboardArmed = acceptsKeyboardInput;
+        _cachedInjected = injected;
         _lastInputSampleTicks = now;
-        return _cachedInputState;
+        return new HostInputSample(
+            _cachedInputState,
+            focused,
+            acceptsKeyboardInput,
+            injected);
     }
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
@@ -584,5 +664,72 @@ public static class PadExports
     {
         const int Deadzone = 10;
         return Math.Abs(controller - 128) > Deadzone ? controller : keyboard;
+    }
+
+    private static uint ResolveInjectedButtons(long nowTicks)
+    {
+        if (!InjectCross || _padOpenedAtTicks == 0)
+        {
+            return 0;
+        }
+
+        var elapsedMs = (nowTicks - _padOpenedAtTicks) * 1000L / Stopwatch.Frequency;
+        if (elapsedMs < InjectAfterMs)
+        {
+            return 0;
+        }
+
+        var cycle = InjectHoldMs + InjectGapMs;
+        if (cycle <= 0)
+        {
+            return 0;
+        }
+
+        var sinceFirst = elapsedMs - InjectAfterMs;
+        var pulseIndex = (int)(sinceFirst / cycle);
+        if (pulseIndex < 0 || pulseIndex >= InjectPulses)
+        {
+            return 0;
+        }
+
+        var offsetInCycle = (int)(sinceFirst % cycle);
+        return offsetInCycle < InjectHoldMs ? OrbisPadButton.Cross : 0;
+    }
+
+    private static void TracePadWrite(string api, HostInputSample sample)
+    {
+        var count = Interlocked.Increment(ref _padWriteCount);
+        var buttons = sample.State.Buttons;
+        var cross = (buttons & OrbisPadButton.Cross) != 0;
+        if (cross && Interlocked.Exchange(ref _crossDeliveredLogged, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] pad.cross_delivered api={api} buttons=0x{buttons:X} " +
+                $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
+                $"inject=0x{sample.Injected:X}");
+        }
+
+        if (!LogPad)
+        {
+            return;
+        }
+
+        var changed = buttons != _lastLoggedButtons;
+        _lastLoggedButtons = buttons;
+        if (count > 8 && count % 5000 != 0 && !changed && !cross)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] pad.read api={api} n={count} buttons=0x{buttons:X} cross={(cross ? 1 : 0)} " +
+            $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
+            $"inject=0x{sample.Injected:X}");
+    }
+
+    private static int ReadPositiveEnvMs(string name, int fallback)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(raw, out var value) && value > 0 ? value : fallback;
     }
 }
