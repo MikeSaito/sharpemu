@@ -3779,7 +3779,8 @@ public static partial class AgcExports
         string debugName,
         ulong packetAddress,
         ulong producerAddress = 0,
-        ulong producerLength = 0)
+        ulong producerLength = 0,
+        bool publishLabelImmediately = false)
     {
         var producer = RegisterLabelProducer(
             ctx.Memory,
@@ -3813,6 +3814,23 @@ public static partial class AgcExports
                 },
                 (ctx, gpuState),
                 preferLocal: false);
+        }
+
+        // Pure CP fence labels (release_mem of an immediate) must not sit behind
+        // multi-MB texture uploads on the Vulkan ordered list: Astro's splash
+        // DCB self-waits on those labels and otherwise crawls for tens of
+        // seconds per wait while the flip CB stays pending. Publish guest
+        // memory now; keep a lightweight ordered tick for timeline consumers.
+        if (publishLabelImmediately &&
+            producerAddress != 0 &&
+            producerLength != 0)
+        {
+            action();
+            CompleteAndWake();
+            _ = VulkanVideoPresenter.SubmitOrderedGuestAction(
+                static () => { },
+                $"{debugName} ordered-tick");
+            return;
         }
 
         void ApplyAndQueueCompletion()
@@ -5190,7 +5208,8 @@ public static partial class AgcExports
             $"release_mem_standard dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
             writesGuestMemory ? destinationAddress : 0,
-            writesGuestMemory ? writeLength : 0);
+            writesGuestMemory ? writeLength : 0,
+            publishLabelImmediately: writesGuestMemory);
     }
 
     private static (uint Destination, uint DataSelection)
@@ -5224,6 +5243,7 @@ public static partial class AgcExports
             2 or 3 => (ulong)sizeof(ulong),
             _ => 0UL,
         };
+        var writesLabel = dataSelection is 1 or 2 or 3 && writeLength != 0;
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
@@ -5253,8 +5273,9 @@ public static partial class AgcExports
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
-            dataSelection is 1 or 2 or 3 ? destinationAddress : 0,
-            writeLength);
+            writesLabel ? destinationAddress : 0,
+            writesLabel ? writeLength : 0,
+            publishLabelImmediately: writesLabel);
     }
 
     private static void ApplySubmittedRegisters(

@@ -379,11 +379,14 @@ public static partial class KernelMemoryCompatExports
         const ulong MaxSane = 2UL * 1024 * 1024 * 1024;
         if (destination < 0x1000 || destination >= CanonicalUserUpper || length > MaxSane)
         {
+            // Corrupt lengths (e.g. Sndz passing ~0xC90A_FE4C00) used to return
+            // MEMORY_FAULT and trip AudioPropagation soft-assert VEH. Treat as a
+            // no-op success so the guest keeps the destination in RAX.
             Console.Error.WriteLine(
                 $"[LOADER][WARNING] Bad Memset Call rip=0x{ctx.Rip:X16} " +
                 $"dst=0x{destination:X16} val=0x{value:X2} len=0x{length:X}");
             ctx[CpuRegister.Rax] = destination;
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
         // Rent may hand back a larger array than requested; only the first chunkLength
