@@ -2427,7 +2427,7 @@ internal static partial class Gen5SpirvTranslator
                                 SpirvOp.ConvertFToS,
                                 _intType,
                                 value),
-                            _ => value,
+                            _ => SanitizeFiniteFloat(value),
                         };
                         continue;
                     }
@@ -2437,7 +2437,7 @@ internal static partial class Gen5SpirvTranslator
                     {
                         Gen5PixelOutputKind.Uint => raw,
                         Gen5PixelOutputKind.Sint => Bitcast(_intType, raw),
-                        _ => Bitcast(_floatType, raw),
+                        _ => SanitizeFiniteFloat(Bitcast(_floatType, raw)),
                     };
                 }
 
@@ -2517,6 +2517,25 @@ internal static partial class Gen5SpirvTranslator
                 _floatType,
                 unpacked,
                 (uint)(component & 1));
+        }
+
+        // Grade/tonemap can feed Inf/NaN into MRT via rcp(0) chains. Keep finite
+        // lanes so A2R10/unorm pack and present exposure see recoverable RGB.
+        private uint SanitizeFiniteFloat(uint value)
+        {
+            var isNan = _module.AddInstruction(SpirvOp.IsNan, _boolType, value);
+            var isInf = _module.AddInstruction(SpirvOp.IsInf, _boolType, value);
+            var nonFinite = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                isNan,
+                isInf);
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                nonFinite,
+                Float(0f),
+                value);
         }
 
         private uint GetPixelOutputType() =>

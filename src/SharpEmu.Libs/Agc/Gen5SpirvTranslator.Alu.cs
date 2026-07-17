@@ -149,16 +149,12 @@ internal static partial class Gen5SpirvTranslator
                 case "VRcpIflagF32":
                     result = EmitFloatResult(
                         instruction,
-                        _module.AddInstruction(
-                            SpirvOp.FDiv,
-                            _floatType,
-                            Float(1),
-                            GetFloatSource(instruction, 0)));
+                        SafeReciprocal(GetFloatSource(instruction, 0)));
                     break;
                 case "VLogF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(30, _floatType, GetFloatSource(instruction, 0)));
+                        SafeLog2(GetFloatSource(instruction, 0)));
                     break;
                 case "VLdexpF32":
                     result = EmitFloatResult(
@@ -177,7 +173,7 @@ internal static partial class Gen5SpirvTranslator
                 case "VRsqF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(32, _floatType, GetFloatSource(instruction, 0)));
+                        SafeReciprocalSqrt(GetFloatSource(instruction, 0)));
                     break;
                 case "VFractF32":
                     result = EmitFloatResult(
@@ -207,7 +203,7 @@ internal static partial class Gen5SpirvTranslator
                 case "VSqrtF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(31, _floatType, GetFloatSource(instruction, 0)));
+                        SafeSqrt(GetFloatSource(instruction, 0)));
                     break;
                 case "VSinF32":
                     result = EmitFloatResult(
@@ -2423,6 +2419,48 @@ internal static partial class Gen5SpirvTranslator
                 Bitcast(_uintType, value),
                 UInt(0xFFFF_E000));
             return Bitcast(_floatType, raw);
+        }
+
+        // Grade/tonemap chains feed rcp(0)/log(0)/sqrt(neg) into MRT as Inf/NaN.
+        // Flush those edge cases to finite values so A2R10 pack and present exposure
+        // see recoverable RGB instead of poison lanes.
+        private uint SafeReciprocal(uint value)
+        {
+            var abs = Ext(4, _floatType, value);
+            var tooSmall = _module.AddInstruction(
+                SpirvOp.FOrdLessThan,
+                _boolType,
+                abs,
+                Float(1e-20f));
+            var reciprocal = _module.AddInstruction(
+                SpirvOp.FDiv,
+                _floatType,
+                Float(1f),
+                value);
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                tooSmall,
+                Float(0f),
+                reciprocal);
+        }
+
+        private uint SafeLog2(uint value)
+        {
+            var clamped = Ext(40, _floatType, value, Float(1e-20f));
+            return Ext(30, _floatType, clamped);
+        }
+
+        private uint SafeSqrt(uint value)
+        {
+            var clamped = Ext(40, _floatType, value, Float(0f));
+            return Ext(31, _floatType, clamped);
+        }
+
+        private uint SafeReciprocalSqrt(uint value)
+        {
+            var clamped = Ext(40, _floatType, value, Float(1e-20f));
+            return Ext(32, _floatType, clamped);
         }
 
         private uint Ext(uint operation, uint resultType, params uint[] operands)

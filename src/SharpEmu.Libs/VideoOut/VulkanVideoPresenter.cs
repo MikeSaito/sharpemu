@@ -226,10 +226,12 @@ internal static unsafe class VulkanVideoPresenter
     }
 
     /// <summary>
-    /// BUFFER_STORE_FORMAT with 32-bit float lanes leaves f32 words in guest RAM.
-    /// Texture formats like fmt71 (R16G16B16A16 float) sample those bytes as halfs,
-    /// which bit-reinterprets f32(0.0078125)=0x3C000000 as (0,0,0,1). Convert when
-    /// uploading R16F textures from a published 32-bit FORMAT buffer write.
+    /// BUFFER_STORE_FORMAT with true 32-bit FLOAT lanes leaves f32 words in guest RAM.
+    /// Texture formats like fmt71 (R16G16B16A16 float) sample those bytes as halfs, so
+    /// e.g. f32(0.0078125)=0x3C000000 becomes halfs (0,0,0,1). Convert numeric f32→f16
+    /// only for FLOAT number format. UINT/SINT 32-bit FORMAT stores often carry
+    /// pre-packed f16 pairs in each word (LUT 0x3C000000 = halfs (0,1)); treating those
+    /// as f32 yields (0,1/128) and breaks composite grade into Inf/NaN.
     /// </summary>
     internal static bool TryLoadHalfFloatTextureFromPublishedFloatBuffer(
         ulong address,
@@ -257,9 +259,9 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        // GFX buffer data formats with 32-bit float lanes.
+        // GFX 32-bit FLOAT lanes only (BUF_NUM_FORMAT_FLOAT = 7).
         if (published.DataFormat is not (4 or 11 or 13 or 14) ||
-            published.NumberFormat is not (4 or 5 or 7))
+            published.NumberFormat != 7)
         {
             return false;
         }
@@ -1010,6 +1012,19 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         return 256f;
+    }
+
+    private static bool IsPresentHdrFallbackEnabled()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_PRESENT_HDR_FALLBACK");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return true;
+        }
+
+        return !string.Equals(raw, "0", StringComparison.Ordinal) &&
+               !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase) &&
+               !string.Equals(raw, "off", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryGetExposedCopyFragmentShader(out byte[] spirv)
@@ -6940,7 +6955,8 @@ internal static unsafe class VulkanVideoPresenter
                                 $"dst={_extent.Width}x{_extent.Height}");
                         }
                     }
-                    else if (_lastHdrPresentCandidate is { } hdrSource &&
+                    else if (IsPresentHdrFallbackEnabled() &&
+                             _lastHdrPresentCandidate is { } hdrSource &&
                              hdrSource.Address != presentedGuestImage.Address &&
                              hdrSource.Initialized &&
                              TryCreateExposedPresentPixels(
