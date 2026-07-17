@@ -131,7 +131,7 @@ internal static class SpirvFixedShaders
         return module.Build();
     }
 
-    public static byte[] CreateCopyFragment()
+    public static byte[] CreateCopyFragment(float rgbScale = 1f)
     {
         var module = new SpirvModuleBuilder();
         module.AddCapability(SpirvCapability.Shader);
@@ -191,6 +191,20 @@ internal static class SpirvFixedShaders
             coordinates,
             2,
             lod);
+        if (rgbScale != 1f)
+        {
+            var scale = module.ConstantFloat(floatType, rgbScale);
+            var scaleAlpha = module.ConstantFloat(floatType, 1f);
+            var scaleVec = module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                vec4Type,
+                scale,
+                scale,
+                scale,
+                scaleAlpha);
+            color = module.AddInstruction(SpirvOp.FMul, vec4Type, color, scaleVec);
+        }
+
         module.AddStatement(SpirvOp.Store, output, color);
         module.AddStatement(SpirvOp.Return);
         module.EndFunction();

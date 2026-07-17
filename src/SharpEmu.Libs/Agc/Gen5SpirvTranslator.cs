@@ -2400,9 +2400,15 @@ internal static partial class Gen5SpirvTranslator
                     var enabled = (export.EnableMask & (1u << component)) != 0;
                     if (!enabled)
                     {
-                        values[component] = _outputKind == Gen5PixelOutputKind.Sint
-                            ? Bitcast(_intType, UInt(0))
-                            : UInt(0);
+                        // Disabled lanes must match the MRT scalar type. Using UInt(0)
+                        // inside a float vec4 CompositeConstruct leaves G/B as NaN on
+                        // the device (seen as 7FFFFFFF / half 7FFF on present readback).
+                        values[component] = _outputKind switch
+                        {
+                            Gen5PixelOutputKind.Uint => UInt(0),
+                            Gen5PixelOutputKind.Sint => Bitcast(_intType, UInt(0)),
+                            _ => Float(0f),
+                        };
                         continue;
                     }
 
