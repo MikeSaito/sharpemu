@@ -36,6 +36,7 @@ public static class AmprExports
         public ulong Buffer;
         public ulong Size;
         public ulong WriteOffset;
+        public ulong PendingCommands;
     }
 
     private sealed class CachedHostFile
@@ -401,9 +402,19 @@ public static class AmprExports
 
         // Same ABI as GetSize/GetCurrentOffset: count in RAX. Observed call-site
         // rsi/rdx are leftover registers, not out-params — do not write them.
-        // Report empty/drained so poll-until-zero callers can proceed.
-        TraceAmpr(ctx, "get_num_commands", commandBuffer, 0, 0);
-        ctx[CpuRegister.Rax] = 0;
+        // Returning the real pending count matters: always-zero hid a full 0x400
+        // command buffer from Astro Bot and it never called apr.submit.
+        ulong pending = 0;
+        if (TryGetCommandBufferState(ctx, commandBuffer, out _, out _, out var state) && state is not null)
+        {
+            lock (state)
+            {
+                pending = state.PendingCommands;
+            }
+        }
+
+        TraceAmpr(ctx, "get_num_commands", commandBuffer, pending, 0);
+        ctx[CpuRegister.Rax] = pending;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -546,6 +557,17 @@ public static class AmprExports
             }
         }
 
+        lock (state)
+        {
+            // Submit drains the queued records; reclaim the ring so later
+            // ReadFile/append calls are not stuck at size (seen with 0x400 CBs).
+            if (state.WriteOffset == writeOffset)
+            {
+                state.WriteOffset = 0;
+                state.PendingCommands = 0;
+            }
+        }
+
         TraceAmpr(ctx, "complete", commandBuffer, buffer, writeOffset);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -601,7 +623,7 @@ public static class AmprExports
             return false;
         }
 
-        UpdateCommandBufferState(commandBuffer, buffer, size, writeOffset);
+        UpdateCommandBufferState(commandBuffer, buffer, size, writeOffset, resetPending: writeOffset == 0);
 
         return true;
     }
@@ -619,7 +641,8 @@ public static class AmprExports
         ulong commandBuffer,
         ulong buffer,
         ulong size,
-        ulong writeOffset)
+        ulong writeOffset,
+        bool resetPending = true)
     {
         var state = _commandBuffers.GetOrAdd(commandBuffer, static _ => new CommandBufferState());
         lock (state)
@@ -627,6 +650,10 @@ public static class AmprExports
             state.Buffer = buffer;
             state.Size = size;
             state.WriteOffset = writeOffset;
+            if (resetPending)
+            {
+                state.PendingCommands = 0;
+            }
         }
     }
 
@@ -659,6 +686,7 @@ public static class AmprExports
                 state.Buffer = buffer;
                 state.Size = size;
                 state.WriteOffset = 0;
+                state.PendingCommands = 0;
             }
 
             return true;
@@ -874,24 +902,61 @@ public static class AmprExports
         }
 
         var recordSize = (ulong)record.Length;
-        lock (state)
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            if (state.Buffer == 0 ||
-                state.WriteOffset > state.Size ||
-                recordSize > state.Size - state.WriteOffset)
+            var needsFlush = false;
+            lock (state)
+            {
+                if (state.Buffer == 0)
+                {
+                    return false;
+                }
+
+                if (state.WriteOffset > state.Size ||
+                    recordSize > state.Size - state.WriteOffset)
+                {
+                    // Tiny guest CBs (e.g. 0x400 ~= 21×0x30 ReadFile records) fill
+                    // before apr.submit. Flushing drains completion side-effects and
+                    // reclaims the ring instead of silently dropping records.
+                    if (attempt == 0 && state.WriteOffset > 0)
+                    {
+                        needsFlush = true;
+                    }
+                    else
+                    {
+                        TraceAmpr(ctx, "append_overflow", commandBuffer, state.WriteOffset, state.Size);
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!ctx.Memory.TryWrite(state.Buffer + state.WriteOffset, record))
+                    {
+                        return false;
+                    }
+
+                    state.WriteOffset += recordSize;
+                    state.PendingCommands++;
+                    return true;
+                }
+            }
+
+            if (!needsFlush)
             {
                 return false;
             }
 
-            if (!ctx.Memory.TryWrite(state.Buffer + state.WriteOffset, record))
+            var flushResult = CompleteCommandBuffer(ctx, commandBuffer);
+            if (flushResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
             {
+                TraceAmpr(ctx, "append_overflow_flush_fail", commandBuffer, unchecked((ulong)flushResult), 0);
                 return false;
             }
 
-            state.WriteOffset += recordSize;
+            TraceAmpr(ctx, "append_overflow_flush", commandBuffer, recordSize, 0);
         }
 
-        return true;
+        return false;
     }
 
     private static bool CompleteKernelEventQueueRecord(CpuContext ctx, ulong recordAddress)
