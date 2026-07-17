@@ -81,8 +81,10 @@ public static class AudioPropagationExports
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    // Astro guest pointers live in the low 4G arenas (stack ~0x0324…, heap
+    // ~0x0326…). Size/alignment immediates such as 0x10010 must not qualify.
     private static bool IsLikelyGuestPointer(ulong address) =>
-        address >= 0x1_0000UL && address < 0x0000_8000_0000_0000UL;
+        address >= 0x0100_0000UL && address < 0x0000_8000_0000_0000UL;
 
     private static ulong ResolveOutPointer(CpuContext ctx, ulong candidate)
     {
