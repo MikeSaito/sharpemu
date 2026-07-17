@@ -1104,16 +1104,18 @@ public static class VideoOutExports
 
         var guestImageSubmitted = false;
         ulong guestImageAddress = 0;
-        if (submitGpuImage &&
-            bufferIndex >= 0 &&
+        if (bufferIndex >= 0 &&
             TryGetDisplayBufferInfo(handle, bufferIndex, out var displayBuffer))
         {
             guestImageAddress = displayBuffer.Address;
-            guestImageSubmitted = GuestGpu.Current.TrySubmitGuestImage(
-                displayBuffer.Address,
-                displayBuffer.Width,
-                displayBuffer.Height,
-                displayBuffer.PitchInPixel);
+            if (submitGpuImage)
+            {
+                guestImageSubmitted = GuestGpu.Current.TrySubmitGuestImage(
+                    displayBuffer.Address,
+                    displayBuffer.Width,
+                    displayBuffer.Height,
+                    displayBuffer.PitchInPixel);
+            }
         }
 
         if (_dumpVideoOut)

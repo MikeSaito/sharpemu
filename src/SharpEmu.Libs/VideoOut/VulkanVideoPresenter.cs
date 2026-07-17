@@ -4946,9 +4946,17 @@ internal static unsafe class VulkanVideoPresenter
 
         private void WaitAllFrameSlots()
         {
+            // Only wait slots that actually submitted a fence. Slots that already
+            // own a flip snapshot but have not set fence-pending yet are mid-
+            // present (e.g. CPU exposure readback); treating them as
+            // "frame-not-submitted" destroys the live VkImage and AV's in
+            // CmdCopyImageToBuffer (null+0x108 on the VideoOut thread).
             for (var slot = 0; slot < _frameFencePending.Length; slot++)
             {
-                WaitFrameSlot(slot);
+                if (_frameFencePending[slot])
+                {
+                    WaitFrameSlot(slot);
+                }
             }
         }
 
@@ -12434,7 +12442,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             bytes = [];
             bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
-            if (bytesPerPixel == 0)
+            if (bytesPerPixel == 0 || image.Image.Handle == 0)
             {
                 return false;
             }
