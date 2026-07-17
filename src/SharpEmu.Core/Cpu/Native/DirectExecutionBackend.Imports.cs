@@ -1854,7 +1854,12 @@ public sealed partial class DirectExecutionBackend
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
-			"27bAgiJmOh0";   // pthread_cond_timedwait
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			// Path tokenization during font/asset load hammers strchr/strrchr on the
+			// same buffer for seconds; treating them as progress resets avoids a
+			// false positive forced exit while AMPR/OpenFontMemory still advance.
+			"ob5xAW4ln-0" or // strchr
+			"9yDWMxEFdJU";   // strrchr
 
 	private void ResetImportLoopPattern()
 	{
