@@ -114,6 +114,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverAudioPropagationSoftAssertAv(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (TryRecoverAuxiliaryThreadExecuteFault(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
@@ -482,20 +487,29 @@ public sealed partial class DirectExecutionBackend
 		var fontSoftAssertArmed = _softAssertInt41SiteSkipped;
 		ulong resumeRip = rip + 2;
 		var softAssertEpilogue = false;
-		// Only Font helper soft-asserts (Astro libSceFont call sites around
-		// 0x800EF****). Broader Result.cpp traps (e.g. AudioPropagation) must
-		// not be redirected once OpenFont armed this path.
+		var recoverReason = "SHARPEMU_IGNORE_INT41=1";
+		// Font helper soft-asserts (Astro libSceFont around 0x800EF****).
 		const ulong fontSoftAssertLo = 0x0000000800EF0000UL;
 		const ulong fontSoftAssertHi = 0x0000000800EF8000UL;
 		var ripInFontSoftAssertBand = rip >= fontSoftAssertLo && rip < fontSoftAssertHi;
-		if (fontSoftAssertArmed &&
+
+		// Known Astro AudioPropagation / Sndz soft-assert int 0x41 sites. These
+		// use short jz (74 xx), so the Font near-jz decoder must not guess.
+		if (TryGetAudioPropagationSoftAssertResume(rip, contextRecord, out var apResume, out var apReason))
+		{
+			softAssertEpilogue = true;
+			resumeRip = apResume;
+			WriteCtxU64(contextRecord, CTX_RAX, 0);
+			recoverReason = apReason;
+		}
+		else if (fontSoftAssertArmed &&
 			ripInFontSoftAssertBand &&
 			TryGetFontSoftAssertSuccessRip(rip, out var successRip))
 		{
 			softAssertEpilogue = true;
 			resumeRip = successRip;
-			// Pretend the checked call succeeded so later tests do not re-assert.
-			WriteCtxU64(contextRecord, 120, 0); // RAX
+			WriteCtxU64(contextRecord, CTX_RAX, 0);
+			recoverReason = $"Font soft-assert -> 0x{resumeRip:X}";
 		}
 
 		if (!_ignoreGuestInt41 && !softAssertEpilogue)
@@ -504,16 +518,130 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		var count = Interlocked.Increment(ref _ignoredGuestInt41Count);
-		WriteCtxU64(contextRecord, 248, resumeRip);
+		WriteCtxU64(contextRecord, CTX_RIP, resumeRip);
 		if (count <= 16 || count % 65536 == 0)
 		{
-			var reason = softAssertEpilogue
-				? $"Font soft-assert -> 0x{resumeRip:X}"
-				: "SHARPEMU_IGNORE_INT41=1";
 			Console.Error.WriteLine(
-				$"[LOADER][WARN] Ignored guest int 0x41 trap #{count} at 0x{rip:X16} ({reason})");
+				$"[LOADER][WARN] Ignored guest int 0x41 trap #{count} at 0x{rip:X16} ({recoverReason})");
 			Console.Error.Flush();
 		}
+		return true;
+	}
+
+	private unsafe static bool TryWriteHostQword(ulong address, ulong value)
+	{
+		if (address < 0x10000)
+		{
+			return false;
+		}
+
+		try
+		{
+			Marshal.WriteInt64((nint)address, unchecked((long)value));
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private unsafe bool TryGetAudioPropagationSoftAssertResume(
+		ulong int41Rip,
+		void* contextRecord,
+		out ulong resumeRip,
+		out string reason)
+	{
+		resumeRip = 0;
+		reason = string.Empty;
+
+		// AudioPropagationContext.cpp:326/327 soft-assert int 0x41 sites.
+		// Runtime places this body near 0x800F61350 (eboot dump near 0x800F983C0).
+		if (int41Rip == 0x0000000800F61350UL || int41Rip == 0x0000000800F983C0UL)
+		{
+			resumeRip = int41Rip == 0x0000000800F61350UL
+				? 0x0000000800F6127BUL
+				: 0x0000000800F982EBUL;
+			reason = $"AudioPropagation channels soft-assert -> 0x{resumeRip:X}";
+			return true;
+		}
+
+		if (int41Rip == 0x0000000800F6139EUL ||
+			int41Rip == 0x0000000800F9840EUL ||
+			(int41Rip >= 0x0000000800F61350UL && int41Rip < 0x0000000800F613B0UL) ||
+			(int41Rip >= 0x0000000800F983C7UL && int41Rip < 0x0000000800F98420UL))
+		{
+			var contextObject = ReadCtxU64(contextRecord, CTX_R13);
+			var expectedGrains = ReadCtxU64(contextRecord, CTX_RSI);
+			if (contextObject >= 0x10000 &&
+				expectedGrains is >= 64 and <= 8192)
+			{
+				_ = TryWriteHostQword(contextObject + 0x20, expectedGrains);
+			}
+
+			resumeRip = int41Rip < 0x0000000800F80000UL
+				? 0x0000000800F6128BUL
+				: 0x0000000800F982FBUL;
+			reason = $"AudioPropagation grain soft-assert -> 0x{resumeRip:X} grain=0x{expectedGrains:X}";
+			return true;
+		}
+
+		return false;
+	}
+
+	private static int _audioPropSoftAssertAvSkips;
+
+	/// <summary>
+	/// Astro AudioPropagation soft-asserts sometimes surface as AV with
+	/// target=0xFFFFFFFFFFFFFFFF at a RIP inside the Result.cpp epilogue
+	/// (mid-instruction after int 0x41), not cleanly on CD 41. Resume at the
+	/// known continue targets so SceSndzAudioOutMain can reach Source*.
+	/// </summary>
+	private unsafe bool TryRecoverAudioPropagationSoftAssertAv(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[1] != ulong.MaxValue)
+		{
+			return false;
+		}
+
+		ulong resumeRip = 0;
+		string reason;
+		// AudioPropagationContext.cpp:326/327 soft-assert epilogue (int41 / Result).
+		if ((rip >= 0x0000000800F612F0UL && rip < 0x0000000800F613B0UL) ||
+			(rip >= 0x0000000800F98385UL && rip < 0x0000000800F98420UL))
+		{
+			var contextObject = ReadCtxU64(contextRecord, CTX_R13);
+			var expectedGrains = ReadCtxU64(contextRecord, CTX_RSI);
+			if (contextObject >= 0x10000 &&
+				expectedGrains is >= 64 and <= 8192)
+			{
+				_ = TryWriteHostQword(contextObject + 0x20, expectedGrains);
+			}
+
+			resumeRip = rip < 0x0000000800F80000UL
+				? 0x0000000800F6128BUL
+				: 0x0000000800F982FBUL;
+			reason = "AudioPropagation grain soft-assert";
+		}
+		else
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, CTX_RAX, 0);
+		WriteCtxU64(contextRecord, CTX_RIP, resumeRip);
+		var count = Interlocked.Increment(ref _audioPropSoftAssertAvSkips);
+		if (count <= 16 || (count & (count - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] AudioPropagation soft-assert AV skip #{count} at 0x{rip:X16} -> 0x{resumeRip:X} ({reason})");
+			Console.Error.Flush();
+		}
+
 		return true;
 	}
 

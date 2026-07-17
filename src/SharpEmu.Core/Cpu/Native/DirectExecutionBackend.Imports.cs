@@ -682,6 +682,10 @@ public sealed partial class DirectExecutionBackend
 				TrySkipSoftAssertInt41Site();
 				TrySkipSoftAssertInt41NearReturn(num7);
 			}
+			if (dispatchResolved && IsAudioPropagationCreateNid(importStubEntry.Nid))
+			{
+				TryPatchAudioPropagationGrainAssert();
+			}
 			if (flag || flag2 || flag3)
 			{
 				Console.Error.WriteLine($"[LOADER][TRACE] ImportRet#{num}: nid={importStubEntry.Nid} result={orbisGen2Result} rax=0x{cpuContext[CpuRegister.Rax]:X16}");
@@ -1440,6 +1444,62 @@ public sealed partial class DirectExecutionBackend
 			"kAenWy1Zw5o" or // sceFontRenderCharGlyphImageHorizontal
 			"LHDoRWVFGqk" or // sceFontDeleteGlyph
 			"gdUCnU0gHdI";   // sceFontRenderSurfaceInit
+
+	private static bool IsAudioPropagationCreateNid(string nid) =>
+		nid is
+			"aNEqtSHdUSo" or // sceAudioPropagationSystemCreate
+			"8bI5h8req30";   // sceAudioPropagationRoomCreate
+
+	private bool _audioPropGrainAssertPatched;
+
+	private unsafe void TryPatchAudioPropagationGrainAssert()
+	{
+		if (_audioPropGrainAssertPatched)
+		{
+			return;
+		}
+
+		// AudioPropagationContext.cpp:326/327:
+		//   cmp r15d, 0x10 / jne soft_assert
+		//   cmp [r13+0x20], sext(numSamples) / jne soft_assert
+		// Soft SystemCreate leaves context+0x20 as 0x201 after guest init while
+		// callers pass numSamples=512; NOP the branches so Sndz can reach Source*.
+		ReadOnlySpan<(ulong Address, int Length)> sites =
+		[
+			(0x0000000800F61275UL, 6), // runtime jne after cmp r15d, 0x10
+			(0x0000000800F61285UL, 6), // runtime jne after cmp [r13+0x20], rsi
+		];
+
+		foreach (var (address, length) in sites)
+		{
+			var opcode = new byte[length];
+			if (!TryReadHostBytes(address, opcode) ||
+				opcode[0] != 0x0F ||
+				opcode[1] is not (0x84 or 0x85))
+			{
+				return;
+			}
+		}
+
+		foreach (var (address, length) in sites)
+		{
+			var nops = new byte[length];
+			nops.AsSpan().Fill(0x90);
+			uint oldProtect = 0;
+			if (!VirtualProtect((void*)address, (nuint)length, 0x40, &oldProtect))
+			{
+				return;
+			}
+
+			Marshal.Copy(nops, 0, unchecked((nint)(long)address), length);
+			VirtualProtect((void*)address, (nuint)length, oldProtect, &oldProtect);
+			FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)length);
+		}
+
+		_audioPropGrainAssertPatched = true;
+		Console.Error.WriteLine(
+			"[LOADER][INFO] AudioPropagation: skipped grain soft-assert branches at 0x800F61275/0x800F61285");
+	}
 
 	private unsafe bool TryNopGuestInt41(ulong int41Rip, string reason)
 	{
