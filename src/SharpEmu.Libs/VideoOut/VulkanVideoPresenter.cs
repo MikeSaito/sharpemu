@@ -6773,6 +6773,203 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        /// <summary>
+        /// When composite grade/clear leaves the flip opaque-black, copy recoverable
+        /// scene HDR into the flip attachment so present can expose the flip itself
+        /// instead of switching the present source away from VideoOut.
+        /// </summary>
+        private bool TryPromoteHdrLuminanceIntoFlip(
+            GuestImageResource flip,
+            GuestImageResource hdr)
+        {
+            if (flip.Address == 0 ||
+                hdr.Address == 0 ||
+                flip.Address == hdr.Address ||
+                flip.Width == 0 ||
+                flip.Height == 0 ||
+                hdr.Width == 0 ||
+                hdr.Height == 0 ||
+                !hdr.Initialized ||
+                flip.IsCpuBacked ||
+                hdr.IsCpuBacked)
+            {
+                return false;
+            }
+
+            // Only promote into the float display stand-in (exposure≠1). A2R10 would
+            // crush near-black HDR again before CPU exposure can lift it.
+            if (flip.Format is not (Format.R32G32B32A32Sfloat or Format.R16G16B16A16Sfloat))
+            {
+                return false;
+            }
+
+            if (hdr.Format is not (Format.R16G16B16A16Sfloat or Format.R32G32B32A32Sfloat or
+                                   Format.B10G11R11UfloatPack32))
+            {
+                return false;
+            }
+
+            try
+            {
+                Check(
+                    _vk.ResetCommandBuffer(_commandBuffer, 0),
+                    "vkResetCommandBuffer(flip luminance promote)");
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(
+                    _vk.BeginCommandBuffer(_commandBuffer, &beginInfo),
+                    "vkBeginCommandBuffer(flip luminance promote)");
+
+                var hdrOld = hdr.Layout == ImageLayout.Undefined
+                    ? ImageLayout.ShaderReadOnlyOptimal
+                    : hdr.Layout;
+                var flipOld = flip.Layout == ImageLayout.Undefined
+                    ? ImageLayout.ColorAttachmentOptimal
+                    : flip.Layout;
+
+                var barriers = stackalloc ImageMemoryBarrier[2];
+                barriers[0] = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderReadBit |
+                                    AccessFlags.ColorAttachmentWriteBit |
+                                    AccessFlags.ShaderWriteBit |
+                                    AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = hdrOld,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = hdr.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                barriers[1] = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderReadBit |
+                                    AccessFlags.ColorAttachmentWriteBit |
+                                    AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = flipOld,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = flip.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.AllCommandsBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    2,
+                    barriers);
+
+                var sourceOffsets = new ImageBlit.SrcOffsetsBuffer();
+                sourceOffsets.Element0 = new Offset3D(0, 0, 0);
+                sourceOffsets.Element1 = new Offset3D((int)hdr.Width, (int)hdr.Height, 1);
+                var destinationOffsets = new ImageBlit.DstOffsetsBuffer();
+                destinationOffsets.Element0 = new Offset3D(0, 0, 0);
+                destinationOffsets.Element1 = new Offset3D((int)flip.Width, (int)flip.Height, 1);
+                var region = new ImageBlit
+                {
+                    SrcSubresource = new ImageSubresourceLayers(
+                        ImageAspectFlags.ColorBit,
+                        0,
+                        0,
+                        1),
+                    SrcOffsets = sourceOffsets,
+                    DstSubresource = new ImageSubresourceLayers(
+                        ImageAspectFlags.ColorBit,
+                        0,
+                        0,
+                        1),
+                    DstOffsets = destinationOffsets,
+                };
+                _vk.CmdBlitImage(
+                    _commandBuffer,
+                    hdr.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    flip.Image,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &region,
+                    Filter.Linear);
+
+                barriers[0] = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = hdr.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                barriers[1] = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit |
+                                    AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = flip.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.AllCommandsBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    2,
+                    barriers);
+
+                Check(
+                    _vk.EndCommandBuffer(_commandBuffer),
+                    "vkEndCommandBuffer(flip luminance promote)");
+                var commandBuffer = _commandBuffer;
+                var submitInfo = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &commandBuffer,
+                };
+                Check(
+                    _vk.QueueSubmit(_queue, 1, &submitInfo, default),
+                    "vkQueueSubmit(flip luminance promote)");
+                Check(
+                    _vk.QueueWaitIdle(_queue),
+                    "vkQueueWaitIdle(flip luminance promote)");
+
+                hdr.Layout = ImageLayout.ShaderReadOnlyOptimal;
+                flip.Layout = ImageLayout.ShaderReadOnlyOptimal;
+                flip.Initialized = true;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] vk.flip_luminance_promote failed: {exception.Message}");
+                return false;
+            }
+        }
+
         private void WaitForRenderWork()
         {
             var gpuWorkInFlight = _pendingGuestSubmissions.Count > 0 || _presentationInFlight;
@@ -6955,19 +7152,43 @@ internal static unsafe class VulkanVideoPresenter
                                 $"dst={_extent.Width}x{_extent.Height}");
                         }
                     }
-                    else if (IsPresentHdrFallbackEnabled() &&
-                             _lastHdrPresentCandidate is { } hdrSource &&
+                    else if (_lastHdrPresentCandidate is { } hdrSource &&
                              hdrSource.Address != presentedGuestImage.Address &&
                              hdrSource.Initialized &&
+                             TryPromoteHdrLuminanceIntoFlip(presentedGuestImage, hdrSource) &&
                              TryCreateExposedPresentPixels(
-                                 hdrSource,
+                                 presentedGuestImage,
                                  exposure,
                                  out exposedPixels) &&
                              (ulong)exposedPixels.Length <= _stagingSize &&
                              ExposedPresentPixelsHaveColor(exposedPixels))
                     {
-                        // Flip target crushed to A2R10/NaN black; last lit HDR RT
-                        // still holds recoverable luminance for present.
+                        // Grade/clear left the flip opaque-black while scene HDR still
+                        // holds luminance — promote into the flip, then expose it.
+                        pixels = exposedPixels;
+                        cpuExposurePresent = true;
+                        if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][TRACE] vk.present_path=cpu_exposure_luminance " +
+                                $"scale={exposure} " +
+                                $"flip=0x{presentedGuestImage.Address:X16} " +
+                                $"hdr=0x{hdrSource.Address:X16} " +
+                                $"fmt={hdrSource.Format}");
+                        }
+                    }
+                    else if (IsPresentHdrFallbackEnabled() &&
+                             _lastHdrPresentCandidate is { } hdrFallback &&
+                             hdrFallback.Address != presentedGuestImage.Address &&
+                             hdrFallback.Initialized &&
+                             TryCreateExposedPresentPixels(
+                                 hdrFallback,
+                                 exposure,
+                                 out exposedPixels) &&
+                             (ulong)exposedPixels.Length <= _stagingSize &&
+                             ExposedPresentPixelsHaveColor(exposedPixels))
+                    {
+                        // Last resort: present exposed HDR directly (not the flip).
                         pixels = exposedPixels;
                         cpuExposurePresent = true;
                         if (ShouldTracePresentedGuestImageContentsForDiagnostics())
@@ -6976,8 +7197,8 @@ internal static unsafe class VulkanVideoPresenter
                                 $"[LOADER][TRACE] vk.present_path=cpu_exposure_hdr " +
                                 $"scale={exposure} " +
                                 $"flip=0x{presentedGuestImage.Address:X16} " +
-                                $"src=0x{hdrSource.Address:X16} " +
-                                $"fmt={hdrSource.Format}");
+                                $"src=0x{hdrFallback.Address:X16} " +
+                                $"fmt={hdrFallback.Format}");
                         }
                     }
                     else if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
