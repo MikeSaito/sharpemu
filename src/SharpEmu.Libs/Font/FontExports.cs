@@ -17,6 +17,7 @@ public static class FontExports
     private const int FontLibraryBlockSize = 0x100;
     private const int FontLibraryMspaceSize = 0x4000;
     private const int FontRendererBlockSize = 0x80;
+    private const int FontInstanceBlockSize = 0x100;
     private const int FontLibraryTailOffset = 0xB8;
     private const int FontLibraryDeviceCacheOffset = 0xB0;
     private const int FontLibraryFlagsOffset = 0x08;
@@ -25,6 +26,7 @@ public static class FontExports
     private const ushort OrbisFontMemKindInitialized = 0x0F00;
     private const ushort OrbisFontLibraryMagic = 0x0F01;
     private const ushort OrbisFontRendererMagic = 0x0F02;
+    private const ushort OrbisFontInstanceMagic = 0x0F03;
     private const uint OrbisFontLibraryFlags = 0x60000000;
     private const uint OrbisFontDeviceCacheOwnedFlag = 1u;
     private const ulong OrbisFontDeviceCacheHeaderMarker = 0x0FF800001000UL;
@@ -289,6 +291,283 @@ public static class FontExports
             $"attach_device_cache_buffer library=0x{libraryAddress:X16} " +
             $"buffer=0x{bufferAddress:X16} size=0x{cacheSize:X} owned={owned}");
         return ctx.SetReturn(0);
+    }
+
+    // OrbisFontGlyphMetrics (render path): floats at +0x00.. used for layout advance.
+    private const int OrbisFontGlyphMetricsSize = 0x40;
+
+    [SysAbiExport(
+        Nid = "IQtleGLL5pQ",
+        ExportName = "sceFontGetRenderCharGlyphMetrics",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontGetRenderCharGlyphMetrics(CpuContext ctx)
+    {
+        var rendererAddress = ctx[CpuRegister.Rdi];
+        var glyphCode = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var metricsAddress = ctx[CpuRegister.Rdx];
+        if (metricsAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // Soft stub: even with a null renderer, fill metrics so callers that
+        // treat success as "metrics written" do not memcpy from a null glyph.
+        Span<byte> metrics = stackalloc byte[OrbisFontGlyphMetricsSize];
+        metrics.Clear();
+        WriteGlyphMetricsStub(metrics, glyphCode);
+        if (!ctx.Memory.TryWrite(metricsAddress, metrics))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"get_render_char_glyph_metrics renderer=0x{rendererAddress:X16} " +
+            $"code=0x{glyphCode:X} metrics=0x{metricsAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "JzCH3SCFnAU",
+        ExportName = "sceFontOpenFontInstance",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontOpenFontInstance(CpuContext ctx)
+    {
+        var libraryAddress = ctx[CpuRegister.Rdi];
+        var sourceFontAddress = ctx[CpuRegister.Rsi];
+        var fontOutAddress = ctx[CpuRegister.Rdx];
+        if (fontOutAddress != 0)
+        {
+            _ = ctx.TryWriteUInt64(fontOutAddress, 0);
+        }
+
+        if (fontOutAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // Soft stub: Astro can call this with a null library after OpenFontSet
+        // NOT_FOUND; still hand back an instance so glyph/layout continues.
+        if (!FontGuestState.TryAllocateFontBuffer(ctx, FontInstanceBlockSize, 0x10, out var fontAddress))
+        {
+            return ctx.SetReturn(OrbisFontErrorAllocationFailed);
+        }
+
+        Span<byte> font = stackalloc byte[FontInstanceBlockSize];
+        font.Clear();
+        BinaryPrimitives.WriteUInt16LittleEndian(font, OrbisFontInstanceMagic);
+        BinaryPrimitives.WriteUInt64LittleEndian(font[0x08..], libraryAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(font[0x10..], sourceFontAddress);
+        if (!ctx.Memory.TryWrite(fontAddress, font) ||
+            !ctx.TryWriteUInt64(fontOutAddress, fontAddress))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"open_font_instance library=0x{libraryAddress:X16} source=0x{sourceFontAddress:X16} " +
+            $"out=0x{fontOutAddress:X16} font=0x{fontAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "3OdRkSjOcog",
+        ExportName = "sceFontBindRenderer",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontBindRenderer(CpuContext ctx)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        var rendererAddress = ctx[CpuRegister.Rsi];
+        if (fontAddress == 0 || rendererAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // Soft stub: record the binding in the font instance header.
+        if (!ctx.TryWriteUInt64(fontAddress + 0x18, rendererAddress))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"bind_renderer font=0x{fontAddress:X16} renderer=0x{rendererAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "N1EBMeGhf7E",
+        ExportName = "sceFontSetScalePixel",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetScalePixel(CpuContext ctx)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        var scalePacked = ctx[CpuRegister.Rsi];
+        if (fontAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // Soft stub: persist the caller's packed w/h scale words on the font object.
+        if (!ctx.TryWriteUInt64(fontAddress + 0x20, scalePacked) ||
+            !ctx.TryWriteUInt64(fontAddress + 0x28, ctx[CpuRegister.Rdx]) ||
+            !ctx.TryWriteUInt64(fontAddress + 0x30, ctx[CpuRegister.Rcx]))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"set_scale_pixel font=0x{fontAddress:X16} scale=0x{scalePacked:X16} " +
+            $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "sw65+7wXCKE",
+        ExportName = "sceFontSetScalePoint",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetScalePoint(CpuContext ctx) =>
+        SoftStubFontScalarState(ctx, "set_scale_point", offset: 0x38);
+
+    [SysAbiExport(
+        Nid = "TMtqoFQjjbA",
+        ExportName = "sceFontSetEffectSlant",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetEffectSlant(CpuContext ctx) =>
+        SoftStubFontScalarState(ctx, "set_effect_slant", offset: 0x50);
+
+    [SysAbiExport(
+        Nid = "v0phZwa4R5o",
+        ExportName = "sceFontSetEffectWeight",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetEffectWeight(CpuContext ctx) =>
+        SoftStubFontScalarState(ctx, "set_effect_weight", offset: 0x68);
+
+    [SysAbiExport(
+        Nid = "imxVx8lm+KM",
+        ExportName = "sceFontGetHorizontalLayout",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontGetHorizontalLayout(CpuContext ctx) =>
+        SoftStubFontLayout(ctx, "get_horizontal_layout");
+
+    [SysAbiExport(
+        Nid = "3BrWWFU+4ts",
+        ExportName = "sceFontGetVerticalLayout",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontGetVerticalLayout(CpuContext ctx) =>
+        SoftStubFontLayout(ctx, "get_vertical_layout");
+
+    [SysAbiExport(
+        Nid = "6vGCkkQJOcI",
+        ExportName = "sceFontSetupRenderScalePixel",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetupRenderScalePixel(CpuContext ctx) =>
+        SoftStubFontOk(ctx, "setup_render_scale_pixel");
+
+    [SysAbiExport(
+        Nid = "nMZid4oDfi4",
+        ExportName = "sceFontSetupRenderScalePoint",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetupRenderScalePoint(CpuContext ctx) =>
+        SoftStubFontOk(ctx, "setup_render_scale_point");
+
+    [SysAbiExport(
+        Nid = "lz9y9UFO2UU",
+        ExportName = "sceFontSetupRenderEffectSlant",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetupRenderEffectSlant(CpuContext ctx) =>
+        SoftStubFontOk(ctx, "setup_render_effect_slant");
+
+    [SysAbiExport(
+        Nid = "XIGorvLusDQ",
+        ExportName = "sceFontSetupRenderEffectWeight",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontSetupRenderEffectWeight(CpuContext ctx) =>
+        SoftStubFontOk(ctx, "setup_render_effect_weight");
+
+    private static int SoftStubFontOk(CpuContext ctx, string label)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        if (fontAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        TraceFont(
+            $"{label} font=0x{fontAddress:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+            $"rdx=0x{ctx[CpuRegister.Rdx]:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    private static int SoftStubFontLayout(CpuContext ctx, string label)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        var layoutAddress = ctx[CpuRegister.Rsi];
+        if (fontAddress == 0 || layoutAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // OrbisFontHorizontalLayout / VerticalLayout: ascent, descent, lineGap, baseLine (floats).
+        Span<byte> layout = stackalloc byte[0x10];
+        BinaryPrimitives.WriteSingleLittleEndian(layout[0x00..], 12f);
+        BinaryPrimitives.WriteSingleLittleEndian(layout[0x04..], 3f);
+        BinaryPrimitives.WriteSingleLittleEndian(layout[0x08..], 2f);
+        BinaryPrimitives.WriteSingleLittleEndian(layout[0x0C..], 0f);
+        if (!ctx.Memory.TryWrite(layoutAddress, layout))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont($"{label} font=0x{fontAddress:X16} out=0x{layoutAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    private static int SoftStubFontScalarState(CpuContext ctx, string label, ulong offset)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        if (fontAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        if (!ctx.TryWriteUInt64(fontAddress + offset, ctx[CpuRegister.Rsi]) ||
+            !ctx.TryWriteUInt64(fontAddress + offset + 0x08, ctx[CpuRegister.Rdx]) ||
+            !ctx.TryWriteUInt64(fontAddress + offset + 0x10, ctx[CpuRegister.Rcx]))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"{label} font=0x{fontAddress:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+            $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    private static void WriteGlyphMetricsStub(Span<byte> metrics, uint glyphCode)
+    {
+        // UCS space / missing glyphs still need a non-zero advance so layout walks.
+        var advance = glyphCode is 0 or 0x20 ? 4f : 8f;
+        var height = 12f;
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x00..], advance); // width
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x04..], height);  // height
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x08..], 0f);      // bearingX
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x0C..], height);  // bearingY
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x10..], advance); // hAdvance
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x14..], 0f);      // vBearingX
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x18..], 0f);      // vBearingY
+        BinaryPrimitives.WriteSingleLittleEndian(metrics[0x1C..], height);  // vAdvance
     }
 
     private static bool TryWriteDeviceCacheHeader(CpuContext ctx, ulong bufferAddress, uint size)
