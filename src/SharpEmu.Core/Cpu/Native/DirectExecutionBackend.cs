@@ -318,6 +318,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private int _ignoredGuestInt41Count;
 
+	private bool _softAssertInt41SiteSkipped;
+
 	private bool _logGuestThreads;
 
 	private bool _logUsleep;
@@ -2099,6 +2101,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				*(int*)(ptr2 + num) = -0x80 + (xmm * 0x10);
 				num += 4;
 			}
+			// Restore guest R10/R11 and x87/MXCSR that were preserved below the
+			// argpack.  The managed return value in RAX must not be overwritten.
+			ptr2[num++] = 0x4D; ptr2[num++] = 0x8B; ptr2[num++] = 0x94; ptr2[num++] = 0x24; // mov r10,[r12-0xA8]
+			*(int*)(ptr2 + num) = unchecked((int)0xFFFFFF58); // -0xA8 = -0xB0+0x08
+			num += 4;
+			ptr2[num++] = 0x4D; ptr2[num++] = 0x8B; ptr2[num++] = 0x9C; ptr2[num++] = 0x24; // mov r11,[r12-0xA0]
+			*(int*)(ptr2 + num) = unchecked((int)0xFFFFFF60); // -0xA0 = -0xB0+0x10
+			num += 4;
+			ptr2[num++] = 0x41; ptr2[num++] = 0x0F; ptr2[num++] = 0xAE; ptr2[num++] = 0x94; ptr2[num++] = 0x24; // ldmxcsr [r12-0x98]
+			*(int*)(ptr2 + num) = unchecked((int)0xFFFFFF68); // -0x98 = -0xB0+0x18
+			num += 4;
+			ptr2[num++] = 0x41; ptr2[num++] = 0xD9; ptr2[num++] = 0xAC; ptr2[num++] = 0x24; // fldcw [r12-0x94]
+			*(int*)(ptr2 + num) = unchecked((int)0xFFFFFF6C); // -0x94 = -0xB0+0x1C
+			num += 4;
 			ptr2[num++] = 76;
 			ptr2[num++] = 137;
 			ptr2[num++] = 228;
@@ -5845,8 +5861,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// guest thread calls Pump (which happens inside blocking HLE primitives:
 	// waits, usleep, pthread_create, entry_return). That leaves a starvation
 	// hole: a guest thread that spins on a non-blocking HLE call (e.g.
-	// sceAudioOutOutput) never pumps, so any thread that was made Ready вЂ” for
-	// example a job worker woken by sceKernelSetEventFlag вЂ” sits in the ready
+	// sceAudioOutOutput) never pumps, so any thread that was made Ready — for
+	// example a job worker woken by sceKernelSetEventFlag — sits in the ready
 	// queue forever. Import progress keeps advancing (the spin), so the stall
 	// watchdog never fires either, and the whole game deadlocks with 0 draws.
 	//

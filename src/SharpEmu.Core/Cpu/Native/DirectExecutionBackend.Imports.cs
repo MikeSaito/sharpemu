@@ -673,6 +673,15 @@ public sealed partial class DirectExecutionBackend
 
 				cpuContext[CpuRegister.Rax] = 0uL;
 			}
+			if (!dispatchResolved &&
+				string.Equals(importStubEntry.Nid, "cKYtVmeSTcw", StringComparison.Ordinal))
+			{
+				// Tip reaches Result.cpp int 0x41 after OpenFont NOT_FOUND while backup
+				// returns from the same hard-assert helper without executing that trap.
+				// Skipping the trap at the shared soft-assert site lets tip continue to
+				// the backup OpenFont / OpenFontMemory retry sequence.
+				TrySkipSoftAssertInt41Site();
+			}
 			if (flag || flag2 || flag3)
 			{
 				Console.Error.WriteLine($"[LOADER][TRACE] ImportRet#{num}: nid={importStubEntry.Nid} result={orbisGen2Result} rax=0x{cpuContext[CpuRegister.Rax]:X16}");
@@ -1407,6 +1416,36 @@ public sealed partial class DirectExecutionBackend
 			Volatile.Write(ref completedGuestThreadState.LastImportResultValid, 1);
 		}
 		return true;
+	}
+
+	private unsafe void TrySkipSoftAssertInt41Site()
+	{
+		if (_softAssertInt41SiteSkipped)
+		{
+			return;
+		}
+
+		// Result.cpp soft-assert trap shared by Astro Bot font open failures.
+		const ulong int41Rip = 0x0000000800002844UL;
+		var opcode = new byte[2];
+		if (!TryReadHostBytes(int41Rip, opcode) || opcode[0] != 0xCD || opcode[1] != 0x41)
+		{
+			return;
+		}
+
+		var patch = new byte[] { 0x90, 0x90 };
+		uint oldProtect = 0;
+		if (!VirtualProtect((void*)int41Rip, (nuint)patch.Length, 0x40, &oldProtect))
+		{
+			return;
+		}
+
+		Marshal.Copy(patch, 0, unchecked((nint)(long)int41Rip), patch.Length);
+		VirtualProtect((void*)int41Rip, (nuint)patch.Length, oldProtect, &oldProtect);
+		FlushInstructionCache(GetCurrentProcess(), (void*)int41Rip, (nuint)patch.Length);
+		_softAssertInt41SiteSkipped = true;
+		Console.Error.WriteLine(
+			"[LOADER][INFO] OpenFont soft-assert: skipped int 0x41 at 0x800002844 for NOT_FOUND continuation");
 	}
 
 	private static bool IsNoBlockLeafImport(string nid) =>
