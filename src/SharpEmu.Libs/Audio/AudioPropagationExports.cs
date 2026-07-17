@@ -18,6 +18,21 @@ public static class AudioPropagationExports
     private const int OpaqueBlockSize = 0x100;
     private static int _nextSystemHandle;
     private static int _nextOpaqueSerial;
+    private static ulong _lastSystemAddress;
+
+
+    private static void TraceAudioProp(string message)
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO_PROP"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] audio_prop.{message}");
+    }
 
     private static int SoftOk(CpuContext ctx) => ctx.SetReturn(0);
 
@@ -150,6 +165,19 @@ public static class AudioPropagationExports
         }
     }
 
+
+    private const int SoftGrainFieldOffset = 0x28;
+
+    // Astro post-Create compares soft+0x28 to numSamples (512). The same QWORD
+    // is then loaded as an object pointer for _Atomic_fetch_sub_4 (NID
+    // 2HnmKiLmV6s) on ptr+8 — VA 0x208 is recovered by libc HLE. Do not stamp
+    // 'APRP' / fake objects into other slots: those magics get loaded as
+    // vtable pointers (AV @0x41505250).
+    private static void SeedSoftSystemWorkspace(Span<byte> header, uint grainCount)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(header[SoftGrainFieldOffset..], grainCount);
+    }
+
     [SysAbiExport(
         Nid = "aNEqtSHdUSo",
         ExportName = "sceAudioPropagationSystemCreate",
@@ -187,17 +215,10 @@ public static class AudioPropagationExports
 
         Span<byte> header = stackalloc byte[SystemBlockSize];
         header.Clear();
-        BinaryPrimitives.WriteUInt32LittleEndian(header, 0x41505250); // 'APRP'
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x08..], handle);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], paramAddress);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x18..], memoryInfoAddress);
-        // Astro post-Create compares numSamples to m_mergedRenderingResult
-        // .m_numOfGrains without calling SourceRender. Seed the soft header
-        // grain field(s) from SystemParam so the check can pass.
-        for (var offset = 0x20; offset <= 0x7C; offset += 4)
-        {
-            BinaryPrimitives.WriteUInt32LittleEndian(header[offset..], grainCount);
-        }
+        SeedSoftSystemWorkspace(header, grainCount);
 
         if (!ctx.Memory.TryWrite(memoryAddress, header))
         {
@@ -205,6 +226,27 @@ public static class AudioPropagationExports
         }
 
         WriteSystemOutCandidates(ctx, memoryAddress, systemOutAddress);
+        _lastSystemAddress = memoryAddress;
+
+        // Also stamp likely caller-frame out locals (SysV: out may not be Win64
+        // rsp+0x28). Astro RoomCreate was still seeing system=NULL after Create.
+        var rbp = ctx[CpuRegister.Rbp];
+        if (IsLikelyGuestPointer(rbp))
+        {
+            ReadOnlySpan<int> rbpOffs = [0x170, 0x168, 0x160, 0x158, 0x150, 0x148, 0x140, 0x138];
+            foreach (var off in rbpOffs)
+            {
+                var slot = rbp - (ulong)off;
+                if (ctx.TryReadUInt64(slot, out var existing) &&
+                    (existing == 0 || existing == memoryAddress || existing == systemOutAddress))
+                {
+                    _ = ctx.TryWriteUInt64(slot, memoryAddress);
+                }
+            }
+        }
+
+        TraceAudioProp(
+            $"system_create handle=0x{handle:X} memory=0x{memoryAddress:X} out=0x{systemOutAddress:X} grains={grainCount} rbp=0x{rbp:X}");
         return ctx.SetReturn(0);
     }
 
@@ -228,9 +270,15 @@ public static class AudioPropagationExports
         var roomOut = ctx[CpuRegister.Rsi];
         if (system == 0)
         {
+            system = _lastSystemAddress;
+        }
+
+        if (system == 0)
+        {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        TraceAudioProp($"room_create system=0x{system:X} out=0x{roomOut:X}");
         return WriteOpaqueOut(ctx, roomOut, 0x4D4F4F52); // 'ROOM'
     }
 
@@ -252,9 +300,15 @@ public static class AudioPropagationExports
         var sourceOut = ctx[CpuRegister.Rsi];
         if (system == 0)
         {
+            system = _lastSystemAddress;
+        }
+
+        if (system == 0)
+        {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        TraceAudioProp($"source_create system=0x{system:X} out=0x{sourceOut:X}");
         return WriteOpaqueOut(ctx, sourceOut, 0x43525353); // 'SRCS'
     }
 

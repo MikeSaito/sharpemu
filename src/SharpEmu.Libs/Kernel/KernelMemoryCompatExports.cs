@@ -137,6 +137,7 @@ public static partial class KernelMemoryCompatExports
     private static ulong _threadAtexitReportCallback;
     private static ulong _threadDtorsCallback;
     private static int _nullMemsetRecoveryCount;
+    private static int _lowPageAtomicRecoveryCount;
     private static int _nonCanonicalMemsetRecoveryCount;
     private static int _inaccessibleMemsetRecoveryCount;
     private static int _hostMemoryWriteFallbackCount;
@@ -322,6 +323,70 @@ public static partial class KernelMemoryCompatExports
                 IsDirect: false,
                 DirectStart: 0);
         }
+    }
+
+    // Compiler-rt / libc++ atomics. Astro's AudioPropagation soft object stores
+    // grainCount (512) at +0x28; the guest then calls _Atomic_fetch_sub_4 on
+    // that value as a pointer (VA 0x208). Windows cannot back the NULL page, so
+    // unmapped low destinations soft-succeed like memset null-dst recovery.
+    [SysAbiExport(
+        Nid = "2HnmKiLmV6s",
+        ExportName = "_Atomic_fetch_sub_4",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int AtomicFetchSub4(CpuContext ctx)
+        => AtomicFetchSub(ctx, byteWidth: 4);
+
+    [SysAbiExport(
+        Nid = "ovtwh8IO3HE",
+        ExportName = "_Atomic_fetch_sub_2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int AtomicFetchSub2(CpuContext ctx)
+        => AtomicFetchSub(ctx, byteWidth: 2);
+
+    private static int AtomicFetchSub(CpuContext ctx, int byteWidth)
+    {
+        var address = ctx[CpuRegister.Rdi];
+        var value = ctx[CpuRegister.Rsi];
+        if (address == 0 || address < 0x10000UL)
+        {
+            var recoveryIndex = Interlocked.Increment(ref _lowPageAtomicRecoveryCount);
+            if (recoveryIndex <= 8)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARNING] atomic_fetch_sub_{byteWidth} low-page recovery#{recoveryIndex}: " +
+                    $"ptr=0x{address:X} val=0x{value:X}");
+            }
+
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (byteWidth == 2)
+        {
+            if (!ctx.TryReadUInt16(address, out var old16))
+            {
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            var next16 = unchecked((ushort)(old16 - (ushort)value));
+            _ = ctx.TryWriteUInt16(address, next16);
+            ctx[CpuRegister.Rax] = old16;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (!ctx.TryReadUInt32(address, out var old32))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        var next32 = unchecked(old32 - (uint)value);
+        _ = ctx.TryWriteUInt32(address, next32);
+        ctx[CpuRegister.Rax] = old32;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
