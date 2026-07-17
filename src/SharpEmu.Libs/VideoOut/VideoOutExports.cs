@@ -660,6 +660,52 @@ public static class VideoOutExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // SceVideoOutVblankStatus (32 bytes): count, processTime, tsc, reserved.
+    // Unresolved stub returned without filling status; Astro Bot then hit guest
+    // INTEGER_DIVIDE_BY_ZERO (0xC0000094) at 0x8002A5854 (~4 min into boot).
+    [SysAbiExport(
+        Nid = "1FZBKy8HeNU",
+        ExportName = "sceVideoOutGetVblankStatus",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetVblankStatus(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        EnsureVblankPumpStarted();
+
+        ulong count;
+        lock (_stateGate)
+        {
+            count = port.VblankCount;
+        }
+
+        // Keep timing fields non-zero so callers that derive rates from the
+        // status never DIV by zero before the first pumped edge arrives.
+        var reportedCount = count == 0 ? 1UL : count;
+        var processTime = reportedCount * 16_667UL;
+        var tsc = unchecked((ulong)Stopwatch.GetTimestamp());
+
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, reportedCount);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, processTime);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, tsc);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0);
+
+        TraceVideoOut(
+            $"videoout.get_vblank_status handle={handle} count={reportedCount} processTime={processTime}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "zgXifHT9ErY",
         ExportName = "sceVideoOutIsFlipPending",
