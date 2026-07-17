@@ -293,8 +293,9 @@ public static class FontExports
         return ctx.SetReturn(0);
     }
 
-    // OrbisFontGlyphMetrics (render path): floats at +0x00.. used for layout advance.
-    private const int OrbisFontGlyphMetricsSize = 0x40;
+    // OrbisFontGlyphMetrics (render path): keep to 8 floats — Astro places this
+    // on the stack next to UTF-8/text scratch; a 0x40 write smashed that pointer.
+    private const int OrbisFontGlyphMetricsSize = 0x20;
 
     [SysAbiExport(
         Nid = "IQtleGLL5pQ",
@@ -327,6 +328,167 @@ public static class FontExports
         return ctx.SetReturn(0);
     }
 
+    private const int FontGlyphBlockSize = 0x80;
+
+    [SysAbiExport(
+        Nid = "C-4Qw5Srlyw",
+        ExportName = "sceFontGenerateCharGlyph",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontGenerateCharGlyph(CpuContext ctx)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        var glyphCode = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var glyphOutAddress = ctx[CpuRegister.Rdx];
+        if (glyphOutAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // Soft stub: allocate an opaque glyph so DeleteGlyph/Render do not see null.
+        if (!FontGuestState.TryAllocateFontBuffer(ctx, FontGlyphBlockSize, 0x10, out var glyphAddress))
+        {
+            return ctx.SetReturn(OrbisFontErrorAllocationFailed);
+        }
+
+        Span<byte> glyph = stackalloc byte[FontGlyphBlockSize];
+        glyph.Clear();
+        BinaryPrimitives.WriteUInt16LittleEndian(glyph, 0x0F04);
+        BinaryPrimitives.WriteUInt64LittleEndian(glyph[0x08..], fontAddress);
+        BinaryPrimitives.WriteUInt32LittleEndian(glyph[0x10..], glyphCode);
+        if (!ctx.Memory.TryWrite(glyphAddress, glyph) ||
+            !ctx.TryWriteUInt64(glyphOutAddress, glyphAddress))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"generate_char_glyph font=0x{fontAddress:X16} code=0x{glyphCode:X} " +
+            $"out=0x{glyphOutAddress:X16} glyph=0x{glyphAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "8-zmgsxkBek",
+        ExportName = "sceFontGlyphDefineAttribute",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontGlyphDefineAttribute(CpuContext ctx)
+    {
+        TraceFont(
+            $"glyph_define_attribute rdi=0x{ctx[CpuRegister.Rdi]:X16} " +
+            $"rsi=0x{ctx[CpuRegister.Rsi]:X16} rdx=0x{ctx[CpuRegister.Rdx]:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "kAenWy1Zw5o",
+        ExportName = "sceFontRenderCharGlyphImageHorizontal",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontRenderCharGlyphImageHorizontal(CpuContext ctx)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        var glyphCode = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var surfaceAddress = ctx[CpuRegister.Rdx];
+        TraceFont(
+            $"render_char_glyph_image_horizontal font=0x{fontAddress:X16} " +
+            $"code=0x{glyphCode:X} surface=0x{surfaceAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "LHDoRWVFGqk",
+        ExportName = "sceFontDeleteGlyph",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontDeleteGlyph(CpuContext ctx)
+    {
+        // Soft stub: Astro may pass null when GenerateCharGlyph was unresolved.
+        TraceFont($"delete_glyph glyph=0x{ctx[CpuRegister.Rdi]:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "gdUCnU0gHdI",
+        ExportName = "sceFontRenderSurfaceInit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontRenderSurfaceInit(CpuContext ctx)
+    {
+        var surfaceAddress = ctx[CpuRegister.Rdi];
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var widthBytes = unchecked((uint)ctx[CpuRegister.Rdx]);
+        var pixelBytes = unchecked((uint)ctx[CpuRegister.Rcx]) & 0xFF;
+        var width = unchecked((uint)ctx[CpuRegister.R8]);
+        var height = unchecked((uint)ctx[CpuRegister.R9]);
+        if (surfaceAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        if (!ctx.TryWriteUInt64(surfaceAddress, bufferAddress) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x08, widthBytes) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x0C, pixelBytes) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x10, width) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x14, height) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x18, 0) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x1C, 0) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x20, width) ||
+            !ctx.TryWriteUInt32(surfaceAddress + 0x24, height))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"render_surface_init surface=0x{surfaceAddress:X16} buffer=0x{bufferAddress:X16} " +
+            $"w={width} h={height} stride={widthBytes}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "KXUpebrFk1U",
+        ExportName = "sceFontOpenFontMemory",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontOpenFontMemory(CpuContext ctx)
+    {
+        var libraryAddress = ctx[CpuRegister.Rdi];
+        var memoryAddress = ctx[CpuRegister.Rsi];
+        var memorySize = ctx[CpuRegister.Rdx];
+        var fontOutAddress = ctx[CpuRegister.R8];
+        if (fontOutAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        // Soft stub: Astro feeds AMPR-backed font blobs here after OpenFontSet
+        // NOT_FOUND. Hand back an opaque font so FontContext keeps a non-null
+        // handle instead of asserting on rpUtf8String.
+        if (!FontGuestState.TryAllocateFontBuffer(ctx, FontInstanceBlockSize, 0x10, out var fontAddress))
+        {
+            return ctx.SetReturn(OrbisFontErrorAllocationFailed);
+        }
+
+        Span<byte> font = stackalloc byte[FontInstanceBlockSize];
+        font.Clear();
+        BinaryPrimitives.WriteUInt16LittleEndian(font, OrbisFontInstanceMagic);
+        BinaryPrimitives.WriteUInt64LittleEndian(font[0x08..], libraryAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(font[0x10..], memoryAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(font[0x18..], memorySize);
+        if (!ctx.Memory.TryWrite(fontAddress, font) ||
+            !ctx.TryWriteUInt64(fontOutAddress, fontAddress))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceFont(
+            $"open_font_memory library=0x{libraryAddress:X16} mem=0x{memoryAddress:X16} " +
+            $"size=0x{memorySize:X} out=0x{fontOutAddress:X16} font=0x{fontAddress:X16}");
+        FontGuestState.RecordOpenFontMemoryHandle(fontAddress);
+        return ctx.SetReturn(0);
+    }
+
     [SysAbiExport(
         Nid = "JzCH3SCFnAU",
         ExportName = "sceFontOpenFontInstance",
@@ -349,6 +511,12 @@ public static class FontExports
 
         // Soft stub: Astro can call this with a null library after OpenFontSet
         // NOT_FOUND; still hand back an instance so glyph/layout continues.
+        // When the source font is also null, reuse the last OpenFontMemory handle.
+        if (sourceFontAddress == 0)
+        {
+            sourceFontAddress = FontGuestState.LastOpenFontMemoryHandle;
+        }
+
         if (!FontGuestState.TryAllocateFontBuffer(ctx, FontInstanceBlockSize, 0x10, out var fontAddress))
         {
             return ctx.SetReturn(OrbisFontErrorAllocationFailed);
@@ -411,16 +579,13 @@ public static class FontExports
         }
 
         // Soft stub: persist the caller's packed w/h scale words on the font object.
-        if (!ctx.TryWriteUInt64(fontAddress + 0x20, scalePacked) ||
-            !ctx.TryWriteUInt64(fontAddress + 0x28, ctx[CpuRegister.Rdx]) ||
-            !ctx.TryWriteUInt64(fontAddress + 0x30, ctx[CpuRegister.Rcx]))
+        if (!ctx.TryWriteUInt64(fontAddress + 0x20, scalePacked))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         TraceFont(
-            $"set_scale_pixel font=0x{fontAddress:X16} scale=0x{scalePacked:X16} " +
-            $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16}");
+            $"set_scale_pixel font=0x{fontAddress:X16} scale=0x{scalePacked:X16}");
         return ctx.SetReturn(0);
     }
 
@@ -499,13 +664,33 @@ public static class FontExports
     private static int SoftStubFontOk(CpuContext ctx, string label)
     {
         var fontAddress = ctx[CpuRegister.Rdi];
+        var outAddress = ctx[CpuRegister.Rsi];
         if (fontAddress == 0)
         {
             return ctx.SetReturn(OrbisFontErrorInvalidParameter);
         }
 
+        // SetupRender* reuses the caller's scale/layout scratch (often stack).
+        // Write only two floats so we do not overrun into the frame canary.
+        if (outAddress != 0)
+        {
+            Span<byte> scale = stackalloc byte[8];
+            BinaryPrimitives.WriteSingleLittleEndian(scale[0x00..], 114f);
+            BinaryPrimitives.WriteSingleLittleEndian(scale[0x04..], 121f);
+            if (ctx.TryReadUInt64(fontAddress + 0x20, out var packed) && packed != 0)
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(scale[0x00..], unchecked((uint)packed));
+                BinaryPrimitives.WriteUInt32LittleEndian(scale[0x04..], unchecked((uint)(packed >> 32)));
+            }
+
+            if (!ctx.Memory.TryWrite(outAddress, scale))
+            {
+                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
         TraceFont(
-            $"{label} font=0x{fontAddress:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+            $"{label} font=0x{fontAddress:X16} rsi=0x{outAddress:X16} " +
             $"rdx=0x{ctx[CpuRegister.Rdx]:X16}");
         return ctx.SetReturn(0);
     }
@@ -519,12 +704,12 @@ public static class FontExports
             return ctx.SetReturn(OrbisFontErrorInvalidParameter);
         }
 
-        // OrbisFontHorizontalLayout / VerticalLayout: ascent, descent, lineGap, baseLine (floats).
-        Span<byte> layout = stackalloc byte[0x10];
+        // Astro passes an unaligned stack scratch that sits next to the frame
+        // canary; keep this to three floats (ascent/descent/lineGap).
+        Span<byte> layout = stackalloc byte[0x0C];
         BinaryPrimitives.WriteSingleLittleEndian(layout[0x00..], 12f);
         BinaryPrimitives.WriteSingleLittleEndian(layout[0x04..], 3f);
         BinaryPrimitives.WriteSingleLittleEndian(layout[0x08..], 2f);
-        BinaryPrimitives.WriteSingleLittleEndian(layout[0x0C..], 0f);
         if (!ctx.Memory.TryWrite(layoutAddress, layout))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -542,16 +727,15 @@ public static class FontExports
             return ctx.SetReturn(OrbisFontErrorInvalidParameter);
         }
 
-        if (!ctx.TryWriteUInt64(fontAddress + offset, ctx[CpuRegister.Rsi]) ||
-            !ctx.TryWriteUInt64(fontAddress + offset + 0x08, ctx[CpuRegister.Rdx]) ||
-            !ctx.TryWriteUInt64(fontAddress + offset + 0x10, ctx[CpuRegister.Rcx]))
+        // SetScale*/SetEffect* take the scalar in RSI; RDX/RCX are often leftover
+        // caller scratch and must not be persisted into the soft instance.
+        if (!ctx.TryWriteUInt64(fontAddress + offset, ctx[CpuRegister.Rsi]))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         TraceFont(
-            $"{label} font=0x{fontAddress:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
-            $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16}");
+            $"{label} font=0x{fontAddress:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16}");
         return ctx.SetReturn(0);
     }
 

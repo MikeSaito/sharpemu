@@ -673,14 +673,14 @@ public sealed partial class DirectExecutionBackend
 
 				cpuContext[CpuRegister.Rax] = 0uL;
 			}
-			if (!dispatchResolved &&
-				string.Equals(importStubEntry.Nid, "cKYtVmeSTcw", StringComparison.Ordinal))
+			if (!dispatchResolved && IsFontSoftAssertNid(importStubEntry.Nid))
 			{
-				// Tip reaches Result.cpp int 0x41 after OpenFont NOT_FOUND while backup
+				// Tip reaches Result.cpp int 0x41 after Font NOT_FOUND while backup
 				// returns from the same hard-assert helper without executing that trap.
-				// Skipping the trap at the shared soft-assert site lets tip continue to
-				// the backup OpenFont / OpenFontMemory retry sequence.
+				// Skipping those traps lets tip continue the OpenFont / OpenFontMemory
+				// retry sequence and later Font setup soft-fails toward RoomLoad.
 				TrySkipSoftAssertInt41Site();
+				TrySkipSoftAssertInt41NearReturn(num7);
 			}
 			if (flag || flag2 || flag3)
 			{
@@ -1418,6 +1418,59 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+	private static bool IsFontSoftAssertNid(string nid) =>
+		nid is
+			"cKYtVmeSTcw" or // sceFontOpenFontSet
+			"KXUpebrFk1U" or // sceFontOpenFontMemory
+			"JzCH3SCFnAU" or // sceFontOpenFontInstance
+			"3OdRkSjOcog" or // sceFontBindRenderer
+			"N1EBMeGhf7E" or // sceFontSetScalePixel
+			"sw65+7wXCKE" or // sceFontSetScalePoint
+			"TMtqoFQjjbA" or // sceFontSetEffectSlant
+			"v0phZwa4R5o" or // sceFontSetEffectWeight
+			"imxVx8lm+KM" or // sceFontGetHorizontalLayout
+			"3BrWWFU+4ts" or // sceFontGetVerticalLayout
+			"6vGCkkQJOcI" or // sceFontSetupRenderScalePixel
+			"nMZid4oDfi4" or // sceFontSetupRenderScalePoint
+			"lz9y9UFO2UU" or // sceFontSetupRenderEffectSlant
+			"XIGorvLusDQ" or // sceFontSetupRenderEffectWeight
+			"IQtleGLL5pQ" or // sceFontGetRenderCharGlyphMetrics
+			"C-4Qw5Srlyw" or // sceFontGenerateCharGlyph
+			"8-zmgsxkBek" or // sceFontGlyphDefineAttribute
+			"kAenWy1Zw5o" or // sceFontRenderCharGlyphImageHorizontal
+			"LHDoRWVFGqk" or // sceFontDeleteGlyph
+			"gdUCnU0gHdI";   // sceFontRenderSurfaceInit
+
+	private unsafe bool TryNopGuestInt41(ulong int41Rip, string reason)
+	{
+		if (!_softAssertInt41SitesSkipped.Add(int41Rip))
+		{
+			return false;
+		}
+
+		var opcode = new byte[2];
+		if (!TryReadHostBytes(int41Rip, opcode) || opcode[0] != 0xCD || opcode[1] != 0x41)
+		{
+			_softAssertInt41SitesSkipped.Remove(int41Rip);
+			return false;
+		}
+
+		var patch = new byte[] { 0x90, 0x90 };
+		uint oldProtect = 0;
+		if (!VirtualProtect((void*)int41Rip, (nuint)patch.Length, 0x40, &oldProtect))
+		{
+			_softAssertInt41SitesSkipped.Remove(int41Rip);
+			return false;
+		}
+
+		Marshal.Copy(patch, 0, unchecked((nint)(long)int41Rip), patch.Length);
+		VirtualProtect((void*)int41Rip, (nuint)patch.Length, oldProtect, &oldProtect);
+		FlushInstructionCache(GetCurrentProcess(), (void*)int41Rip, (nuint)patch.Length);
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] Font soft-assert: skipped int 0x41 at 0x{int41Rip:X} ({reason})");
+		return true;
+	}
+
 	private unsafe void TrySkipSoftAssertInt41Site()
 	{
 		if (_softAssertInt41SiteSkipped)
@@ -1426,26 +1479,27 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		// Result.cpp soft-assert trap shared by Astro Bot font open failures.
+		// Only this shared helper is safe to NOP: fall-through returns to the
+		// caller. Local Font sites (test/jz/int41/jmp-fail) must redirect to the
+		// jz success target via TryRecoverGuestInt41 instead.
 		const ulong int41Rip = 0x0000000800002844UL;
-		var opcode = new byte[2];
-		if (!TryReadHostBytes(int41Rip, opcode) || opcode[0] != 0xCD || opcode[1] != 0x41)
+		if (TryNopGuestInt41(int41Rip, "OpenFont NOT_FOUND continuation"))
 		{
-			return;
+			_softAssertInt41SiteSkipped = true;
 		}
+	}
 
-		var patch = new byte[] { 0x90, 0x90 };
-		uint oldProtect = 0;
-		if (!VirtualProtect((void*)int41Rip, (nuint)patch.Length, 0x40, &oldProtect))
+	private unsafe void TrySkipSoftAssertInt41NearReturn(ulong returnRip)
+	{
+		// Near-return CD 41 sites in Font helpers are test/jz/int41/jmp-fail
+		// sequences; NOP would fall into the fail path. Arm soft-assert mode so
+		// TryRecoverGuestInt41 can redirect to the jz success target instead.
+		_ = returnRip;
+		if (!_softAssertInt41SiteSkipped &&
+			TryNopGuestInt41(0x0000000800002844UL, "OpenFont NOT_FOUND continuation"))
 		{
-			return;
+			_softAssertInt41SiteSkipped = true;
 		}
-
-		Marshal.Copy(patch, 0, unchecked((nint)(long)int41Rip), patch.Length);
-		VirtualProtect((void*)int41Rip, (nuint)patch.Length, oldProtect, &oldProtect);
-		FlushInstructionCache(GetCurrentProcess(), (void*)int41Rip, (nuint)patch.Length);
-		_softAssertInt41SiteSkipped = true;
-		Console.Error.WriteLine(
-			"[LOADER][INFO] OpenFont soft-assert: skipped int 0x41 at 0x800002844 for NOT_FOUND continuation");
 	}
 
 	private static bool IsNoBlockLeafImport(string nid) =>

@@ -319,6 +319,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private int _ignoredGuestInt41Count;
 
 	private bool _softAssertInt41SiteSkipped;
+	private readonly HashSet<ulong> _softAssertInt41SitesSkipped = new();
 
 	private bool _logGuestThreads;
 

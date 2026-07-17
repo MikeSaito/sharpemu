@@ -468,7 +468,7 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe bool TryRecoverGuestInt41(uint exceptionCode, void* contextRecord, ulong rip)
 	{
-		if (!_ignoreGuestInt41 || exceptionCode != 3221225477u || rip < 0x10000)
+		if (exceptionCode != 3221225477u || rip < 0x10000)
 		{
 			return false;
 		}
@@ -479,15 +479,61 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
+		var fontSoftAssertArmed = _softAssertInt41SiteSkipped;
+		ulong resumeRip = rip + 2;
+		var softAssertEpilogue = false;
+		if (fontSoftAssertArmed &&
+			TryGetFontSoftAssertSuccessRip(rip, out var successRip))
+		{
+			softAssertEpilogue = true;
+			resumeRip = successRip;
+			// Pretend the checked call succeeded so later tests do not re-assert.
+			WriteCtxU64(contextRecord, 120, 0); // RAX
+		}
+
+		if (!_ignoreGuestInt41 && !softAssertEpilogue)
+		{
+			return false;
+		}
+
 		var count = Interlocked.Increment(ref _ignoredGuestInt41Count);
-		WriteCtxU64(contextRecord, 248, rip + 2);
+		WriteCtxU64(contextRecord, 248, resumeRip);
 		if (count <= 16 || count % 65536 == 0)
 		{
+			var reason = softAssertEpilogue
+				? $"Font soft-assert -> 0x{resumeRip:X}"
+				: "SHARPEMU_IGNORE_INT41=1";
 			Console.Error.WriteLine(
-				$"[LOADER][WARN] Ignored guest int 0x41 trap #{count} at 0x{rip:X16} (SHARPEMU_IGNORE_INT41=1)");
+				$"[LOADER][WARN] Ignored guest int 0x41 trap #{count} at 0x{rip:X16} ({reason})");
 			Console.Error.Flush();
 		}
 		return true;
+	}
+
+	private bool TryGetFontSoftAssertSuccessRip(ulong int41Rip, out ulong successRip)
+	{
+		successRip = 0;
+		// Soft Result checks compile to: test eax,eax / jz <cont> / int 0x41 [/ jmp fail]
+		if (int41Rip < 8)
+		{
+			return false;
+		}
+
+		var prefix = new byte[8];
+		if (!TryReadHostBytes(int41Rip - 8, prefix))
+		{
+			return false;
+		}
+
+		if (prefix[0] != 0x85 || prefix[1] != 0xC0 ||
+			prefix[2] != 0x0F || prefix[3] != 0x84)
+		{
+			return false;
+		}
+
+		var disp = BinaryPrimitives.ReadInt32LittleEndian(prefix.AsSpan(4));
+		successRip = unchecked(int41Rip + (ulong)disp);
+		return successRip >= 0x10000;
 	}
 
 	private unsafe static bool TryRecoverGuestAllocatorHole(

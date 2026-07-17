@@ -27,6 +27,31 @@ internal static class FontGuestState
     private static ulong _regionBase;
     private static ulong _regionSize;
     private static ulong _bumpOffset;
+    private static ulong _lastOpenFontMemoryHandle;
+
+    internal static void RecordOpenFontMemoryHandle(ulong fontAddress)
+    {
+        if (fontAddress == 0)
+        {
+            return;
+        }
+
+        lock (Gate)
+        {
+            _lastOpenFontMemoryHandle = fontAddress;
+        }
+    }
+
+    internal static ulong LastOpenFontMemoryHandle
+    {
+        get
+        {
+            lock (Gate)
+            {
+                return _lastOpenFontMemoryHandle;
+            }
+        }
+    }
 
     internal static void RecordMemoryInit(ulong regionBase, ulong regionSize)
     {
