@@ -1,414 +1,327 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using SharpEmu.HLE;
 using System.Buffers.Binary;
+using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Font;
 
 public static class FontExports
 {
-    private const int OrbisFontErrorInvalidParameter = unchecked((int)0x80460002);
-    private const int OrbisFontErrorInvalidMemory = unchecked((int)0x80460003);
-    private const int OrbisFontErrorInvalidLibrary = unchecked((int)0x80460004);
-    private const int OrbisFontErrorAllocationFailed = unchecked((int)0x80460010);
-    private const int OrbisFontErrorAlreadyAttached = unchecked((int)0x80460022);
-    private const int OrbisFontMemSize = 0x40;
-    private const int FontLibraryBlockSize = 0x100;
-    private const int FontLibraryMspaceSize = 0x4000;
-    private const int FontRendererBlockSize = 0x80;
-    private const int FontLibraryTailOffset = 0xB8;
-    private const int FontLibraryDeviceCacheOffset = 0xB0;
-    private const int FontLibraryFlagsOffset = 0x08;
-    private const int FontLibraryMagicOffset = 0x00;
-    private const int DeviceCacheMinSize = 0x1020;
-    private const ushort OrbisFontMemKindInitialized = 0x0F00;
-    private const ushort OrbisFontLibraryMagic = 0x0F01;
-    private const ushort OrbisFontRendererMagic = 0x0F02;
-    private const uint OrbisFontLibraryFlags = 0x60000000;
-    private const uint OrbisFontDeviceCacheOwnedFlag = 1u;
-    private const ulong OrbisFontDeviceCacheHeaderMarker = 0x0FF800001000UL;
-
     [SysAbiExport(
         Nid = "whrS4oksXc4",
         ExportName = "sceFontMemoryInit",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int FontMemoryInit(CpuContext ctx)
+    public static int MemoryInit(CpuContext ctx)
     {
-        var memDescAddress = ctx[CpuRegister.Rdi];
+        var descriptorAddress = ctx[CpuRegister.Rdi];
         var regionAddress = ctx[CpuRegister.Rsi];
-        var regionSize = ctx[CpuRegister.Rdx];
-        var ifaceAddress = ctx[CpuRegister.Rcx];
+        var regionSize = (uint)ctx[CpuRegister.Rdx];
+        var interfaceAddress = ctx[CpuRegister.Rcx];
         var mspaceAddress = ctx[CpuRegister.R8];
-        var destroyCallbackAddress = ctx[CpuRegister.R9];
-        if (memDescAddress == 0)
+        var destroyCallback = ctx[CpuRegister.R9];
+        if (descriptorAddress == 0 ||
+            !TryWriteUInt32(ctx, descriptorAddress, 0x00000F00) ||
+            !TryWriteUInt32(ctx, descriptorAddress + 0x04, regionSize) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x08, regionAddress) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x10, mspaceAddress) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x18, interfaceAddress) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x20, destroyCallback) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x28, 0) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x30, 0) ||
+            !ctx.TryWriteUInt64(descriptorAddress + 0x38, mspaceAddress))
         {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        if (ifaceAddress == 0 && (regionAddress == 0 || regionSize == 0))
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
-        }
-
-        if (!ctx.TryReadUInt64(ctx[CpuRegister.Rsp] + 0x08, out var destroyContextAddress))
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        Span<byte> memDesc = stackalloc byte[OrbisFontMemSize];
-        memDesc.Clear();
-        BinaryPrimitives.WriteUInt16LittleEndian(memDesc, OrbisFontMemKindInitialized);
-        BinaryPrimitives.WriteUInt32LittleEndian(memDesc[0x04..], checked((uint)regionSize));
-        BinaryPrimitives.WriteUInt64LittleEndian(memDesc[0x08..], regionAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(memDesc[0x10..], mspaceAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(memDesc[0x18..], ifaceAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(memDesc[0x20..], destroyCallbackAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(memDesc[0x28..], destroyContextAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(memDesc[0x38..], mspaceAddress);
-
-        if (!ctx.Memory.TryWrite(memDescAddress, memDesc))
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        FontGuestState.RecordMemoryInit(regionAddress, regionSize);
-
-        TraceFont(
-            $"memory_init mem_desc=0x{memDescAddress:X16} region=0x{regionAddress:X16} " +
-            $"region_size=0x{regionSize:X} iface=0x{ifaceAddress:X16} mspace=0x{mspaceAddress:X16}");
-        return ctx.SetReturn(0);
+        return SetSuccess(ctx);
     }
 
     [SysAbiExport(
         Nid = "n590hj5Oe-k",
         ExportName = "sceFontCreateLibraryWithEdition",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int FontCreateLibraryWithEdition(CpuContext ctx)
-    {
-        var memoryAddress = ctx[CpuRegister.Rdi];
-        var driverTableAddress = ctx[CpuRegister.Rsi];
-        var edition = ctx[CpuRegister.Rdx];
-        var libraryOutAddress = ctx[CpuRegister.Rcx];
-        if (libraryOutAddress != 0)
-        {
-            _ = ctx.TryWriteUInt64(libraryOutAddress, 0);
-        }
-
-        if (memoryAddress == 0 || driverTableAddress == 0 || libraryOutAddress == 0)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
-        }
-
-        if (!TryReadMemoryDescriptor(ctx, memoryAddress, out var memory) ||
-            memory.MemKind != OrbisFontMemKindInitialized ||
-            memory.IfaceAddress == 0)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidMemory);
-        }
-
-        if (!TryReadMemoryInterface(ctx, memory.IfaceAddress, out var iface) ||
-            iface.AllocAddress == 0 ||
-            iface.DeallocAddress == 0)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidMemory);
-        }
-
-        if (!FontGuestState.TryBumpAllocateZeroed(ctx, FontLibraryBlockSize, 0x10, out var libraryAddress) ||
-            !FontGuestState.TryBumpAllocateZeroed(ctx, FontLibraryMspaceSize, 0x10, out var mspaceAddress))
-        {
-            return ctx.SetReturn(OrbisFontErrorAllocationFailed);
-        }
-
-        if (!TryWriteFontLibrary(
-                ctx,
-                libraryAddress,
-                mspaceAddress,
-                memory,
-                iface,
-                driverTableAddress) ||
-            !ctx.TryWriteUInt64(libraryOutAddress, libraryAddress))
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        TraceFont(
-            $"create_library_with_edition memory=0x{memoryAddress:X16} driver=0x{driverTableAddress:X16} " +
-            $"edition=0x{edition:X16} library=0x{libraryAddress:X16} mspace=0x{mspaceAddress:X16}");
-        return ctx.SetReturn(0);
-    }
+    public static int CreateLibraryWithEdition(CpuContext ctx) =>
+        CreateOpaqueHandle(ctx, ctx[CpuRegister.Rcx], 0x100, magic: 0x0F01);
 
     [SysAbiExport(
         Nid = "WaSFJoRWXaI",
         ExportName = "sceFontCreateRendererWithEdition",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int FontCreateRendererWithEdition(CpuContext ctx)
+    public static int CreateRendererWithEdition(CpuContext ctx) =>
+        CreateOpaqueHandle(ctx, ctx[CpuRegister.Rcx], 0x100, magic: 0x0F07);
+
+    [SysAbiExport(
+        Nid = "3OdRkSjOcog",
+        ExportName = "sceFontBindRenderer",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int BindRenderer(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "N1EBMeGhf7E",
+        ExportName = "sceFontSetScalePixel",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int SetScalePixel(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "TMtqoFQjjbA",
+        ExportName = "sceFontSetEffectSlant",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int SetEffectSlant(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "v0phZwa4R5o",
+        ExportName = "sceFontSetEffectWeight",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int SetEffectWeight(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "6vGCkkQJOcI",
+        ExportName = "sceFontSetupRenderScalePixel",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int SetupRenderScalePixel(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "lz9y9UFO2UU",
+        ExportName = "sceFontSetupRenderEffectSlant",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int SetupRenderEffectSlant(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "XIGorvLusDQ",
+        ExportName = "sceFontSetupRenderEffectWeight",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int SetupRenderEffectWeight(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "imxVx8lm+KM",
+        ExportName = "sceFontGetHorizontalLayout",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GetHorizontalLayout(CpuContext ctx)
     {
-        var libraryAddress = ctx[CpuRegister.Rdi];
-        var driverTableAddress = ctx[CpuRegister.Rsi];
-        var edition = ctx[CpuRegister.Rdx];
-        var rendererOutAddress = ctx[CpuRegister.Rcx];
-        var arg4 = ctx[CpuRegister.R8];
-        var arg5 = ctx[CpuRegister.R9];
-        if (rendererOutAddress != 0)
+        var layoutAddress = ctx[CpuRegister.Rsi];
+        if (layoutAddress == 0)
         {
-            _ = ctx.TryWriteUInt64(rendererOutAddress, 0);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (libraryAddress == 0 || driverTableAddress == 0 || rendererOutAddress == 0)
+        // Baseline, line advance, decoration extent: the same invented geometry
+        // as GetRenderCharGlyphMetrics.
+        var values = new[] { 12.0f, 16.0f, 0.0f };
+        for (var index = 0; index < values.Length; index++)
         {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+            if (!TryWriteUInt32(
+                    ctx,
+                    layoutAddress + (ulong)(index * sizeof(float)),
+                    BitConverter.SingleToUInt32Bits(values[index])))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
         }
 
-        if (!FontGuestState.TryAllocateFontBuffer(ctx, FontRendererBlockSize, 0x10, out var rendererAddress))
+        return SetSuccess(ctx);
+    }
+
+    [SysAbiExport(
+        Nid = "cKYtVmeSTcw",
+        ExportName = "sceFontOpenFontSet",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int OpenFontSet(CpuContext ctx) =>
+        CreateOpaqueHandle(ctx, ctx[CpuRegister.R8], 0x100, magic: 0x0F02);
+
+    [SysAbiExport(
+        Nid = "KXUpebrFk1U",
+        ExportName = "sceFontOpenFontMemory",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int OpenFontMemory(CpuContext ctx) =>
+        CreateOpaqueHandle(ctx, ctx[CpuRegister.R8], 0x100, magic: 0x0F02);
+
+    [SysAbiExport(
+        Nid = "JzCH3SCFnAU",
+        ExportName = "sceFontOpenFontInstance",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int OpenFontInstance(CpuContext ctx)
+    {
+        var sourceHandle = ctx[CpuRegister.Rdi];
+        var setupHandle = ctx[CpuRegister.Rsi];
+        var outputAddress = ctx[CpuRegister.Rdx];
+        if (outputAddress == 0)
         {
-            return ctx.SetReturn(OrbisFontErrorAllocationFailed);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!TryWriteFontRenderer(ctx, rendererAddress, libraryAddress, driverTableAddress, edition, arg4, arg5) ||
-            !ctx.TryWriteUInt64(rendererOutAddress, rendererAddress))
+        if (setupHandle != 0)
         {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return ctx.TryWriteUInt64(outputAddress, setupHandle)
+                ? SetSuccess(ctx)
+                : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceFont(
-            $"create_renderer_with_edition library=0x{libraryAddress:X16} driver=0x{driverTableAddress:X16} " +
-            $"edition=0x{edition:X16} out=0x{rendererOutAddress:X16} renderer=0x{rendererAddress:X16} " +
-            $"arg4=0x{arg4:X16} arg5=0x{arg5:X16}");
-        return ctx.SetReturn(0);
+        if (!TryAllocateOpaque(ctx, 0x100, out var handle))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (sourceHandle != 0)
+        {
+            Span<byte> source = stackalloc byte[0x100];
+            if (ctx.Memory.TryRead(sourceHandle, source))
+            {
+                _ = ctx.Memory.TryWrite(handle, source);
+            }
+        }
+
+        _ = TryWriteUInt16(ctx, handle, 0x0F02);
+        return ctx.TryWriteUInt64(outputAddress, handle)
+            ? SetSuccess(ctx)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     [SysAbiExport(
         Nid = "SsRbbCiWoGw",
         ExportName = "sceFontSupportSystemFonts",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int FontSupportSystemFonts(CpuContext ctx)
-    {
-        var libraryAddress = ctx[CpuRegister.Rdi];
-        if (libraryAddress == 0)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
-        }
-
-        TraceFont($"support_system_fonts library=0x{libraryAddress:X16}");
-        return ctx.SetReturn(0);
-    }
+    public static int SupportSystemFonts(CpuContext ctx) => SetSuccess(ctx);
 
     [SysAbiExport(
         Nid = "mz2iTY0MK4A",
         ExportName = "sceFontSupportExternalFonts",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int FontSupportExternalFonts(CpuContext ctx)
-    {
-        var libraryAddress = ctx[CpuRegister.Rdi];
-        var fontMax = ctx[CpuRegister.Rsi];
-        var formats = ctx[CpuRegister.Rdx];
-        if (libraryAddress == 0)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
-        }
-
-        TraceFont(
-            $"support_external_fonts library=0x{libraryAddress:X16} " +
-            $"font_max=0x{fontMax:X} formats=0x{formats:X}");
-        return ctx.SetReturn(0);
-    }
+    public static int SupportExternalFonts(CpuContext ctx) => SetSuccess(ctx);
 
     [SysAbiExport(
         Nid = "CUKn5pX-NVY",
         ExportName = "sceFontAttachDeviceCacheBuffer",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int FontAttachDeviceCacheBuffer(CpuContext ctx)
+    public static int AttachDeviceCacheBuffer(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "IQtleGLL5pQ",
+        ExportName = "sceFontGetRenderCharGlyphMetrics",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GetRenderCharGlyphMetrics(CpuContext ctx)
     {
-        var libraryAddress = ctx[CpuRegister.Rdi];
+        var metricsAddress = ctx[CpuRegister.Rdx];
+        if (metricsAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var values = new[] { 8.0f, 16.0f, 0.0f, 12.0f, 8.0f, 0.0f, 0.0f, 16.0f };
+        for (var index = 0; index < values.Length; index++)
+        {
+            if (!TryWriteUInt32(
+                    ctx,
+                    metricsAddress + (ulong)(index * sizeof(float)),
+                    BitConverter.SingleToUInt32Bits(values[index])))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return SetSuccess(ctx);
+    }
+
+    [SysAbiExport(
+        Nid = "gdUCnU0gHdI",
+        ExportName = "sceFontRenderSurfaceInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int RenderSurfaceInit(CpuContext ctx)
+    {
+        var surfaceAddress = ctx[CpuRegister.Rdi];
         var bufferAddress = ctx[CpuRegister.Rsi];
-        var cacheSize = ctx[CpuRegister.Rdx];
-        if (libraryAddress == 0)
+        var widthBytes = (uint)ctx[CpuRegister.Rdx];
+        var pixelBytes = (uint)ctx[CpuRegister.Rcx] & 0xFF;
+        var width = (uint)ctx[CpuRegister.R8];
+        var height = (uint)ctx[CpuRegister.R9];
+        if (surfaceAddress == 0 ||
+            !ctx.TryWriteUInt64(surfaceAddress, bufferAddress) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x08, widthBytes) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x0C, pixelBytes) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x10, width) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x14, height) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x18, 0) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x1C, 0) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x20, width) ||
+            !TryWriteUInt32(ctx, surfaceAddress + 0x24, height))
         {
-            return ctx.SetReturn(OrbisFontErrorInvalidLibrary);
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        if (!ctx.TryReadUInt16(libraryAddress + FontLibraryMagicOffset, out var magic) ||
-            magic != OrbisFontLibraryMagic)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidLibrary);
-        }
-
-        if (!ctx.TryReadUInt64(libraryAddress + FontLibraryDeviceCacheOffset, out var existingCache))
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        if (existingCache != 0)
-        {
-            return ctx.SetReturn(OrbisFontErrorAlreadyAttached);
-        }
-
-        if (cacheSize < DeviceCacheMinSize)
-        {
-            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
-        }
-
-        var owned = false;
-        if (bufferAddress == 0)
-        {
-            if (!FontGuestState.TryAllocateFontBuffer(ctx, cacheSize, 0x10, out bufferAddress))
-            {
-                return ctx.SetReturn(OrbisFontErrorAllocationFailed);
-            }
-
-            owned = true;
-        }
-
-        if (!TryWriteDeviceCacheHeader(ctx, bufferAddress, checked((uint)cacheSize)))
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        if (owned)
-        {
-            if (!ctx.TryReadUInt32(libraryAddress + FontLibraryFlagsOffset, out var flags) ||
-                !ctx.TryWriteUInt32(libraryAddress + FontLibraryFlagsOffset, flags | OrbisFontDeviceCacheOwnedFlag))
-            {
-                return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-            }
-        }
-
-        if (!ctx.TryWriteUInt64(libraryAddress + FontLibraryDeviceCacheOffset, bufferAddress))
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-        }
-
-        TraceFont(
-            $"attach_device_cache_buffer library=0x{libraryAddress:X16} " +
-            $"buffer=0x{bufferAddress:X16} size=0x{cacheSize:X} owned={owned}");
-        return ctx.SetReturn(0);
+        return SetSuccess(ctx);
     }
 
-    private static bool TryWriteDeviceCacheHeader(CpuContext ctx, ulong bufferAddress, uint size)
+    private static int CreateOpaqueHandle(CpuContext ctx, ulong outputAddress, int size, ushort magic)
     {
-        var pageCount = (size - 0x1000u) >> 12;
-        Span<byte> header = stackalloc byte[0x18];
-        header.Clear();
-        BinaryPrimitives.WriteUInt32LittleEndian(header, size);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[0x04..], pageCount);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[0x08..], 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[0x0C..], pageCount);
-        BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], OrbisFontDeviceCacheHeaderMarker);
-        return ctx.Memory.TryWrite(bufferAddress, header);
+        if (outputAddress == 0 || !TryAllocateOpaque(ctx, size, out var handle))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!TryWriteUInt16(ctx, handle, magic) || !ctx.TryWriteUInt64(outputAddress, handle))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetSuccess(ctx);
     }
 
-    private static bool TryWriteFontRenderer(
-        CpuContext ctx,
-        ulong rendererAddress,
-        ulong libraryAddress,
-        ulong driverTableAddress,
-        ulong edition,
-        ulong arg4,
-        ulong arg5)
+    private static bool TryAllocateOpaque(CpuContext ctx, int size, out ulong address)
     {
-        Span<byte> renderer = stackalloc byte[FontRendererBlockSize];
-        renderer.Clear();
-        BinaryPrimitives.WriteUInt16LittleEndian(renderer, OrbisFontRendererMagic);
-        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x08..], libraryAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x10..], driverTableAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x18..], edition);
-        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x20..], arg4);
-        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x28..], arg5);
-        BinaryPrimitives.WriteUInt64LittleEndian(renderer[0x30..], rendererAddress);
-        return ctx.Memory.TryWrite(rendererAddress, renderer);
-    }
-
-    private static bool TryReadMemoryDescriptor(CpuContext ctx, ulong address, out FontMemoryDescriptor memory)
-    {
-        memory = default;
-        Span<byte> buffer = stackalloc byte[OrbisFontMemSize];
-        if (!ctx.Memory.TryRead(address, buffer))
+        address = 0;
+        if (ctx.Memory is not IGuestMemoryAllocator allocator ||
+            !allocator.TryAllocateGuestMemory((ulong)size, 0x10, out address))
         {
             return false;
         }
 
-        memory = new FontMemoryDescriptor(
-            BinaryPrimitives.ReadUInt16LittleEndian(buffer),
-            BinaryPrimitives.ReadUInt32LittleEndian(buffer[0x04..]),
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x08..]),
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x10..]),
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x18..]));
-        return true;
+        Span<byte> bytes = stackalloc byte[size];
+        bytes.Clear();
+        return ctx.Memory.TryWrite(address, bytes);
     }
 
-    private static bool TryReadMemoryInterface(CpuContext ctx, ulong address, out FontMemoryInterface iface)
+    private static bool TryWriteUInt16(CpuContext ctx, ulong address, ushort value)
     {
-        iface = default;
-        Span<byte> buffer = stackalloc byte[0x30];
-        if (!ctx.Memory.TryRead(address, buffer))
-        {
-            return false;
-        }
-
-        iface = new FontMemoryInterface(
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer),
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x08..]),
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x10..]),
-            BinaryPrimitives.ReadUInt64LittleEndian(buffer[0x18..]));
-        return true;
+        Span<byte> bytes = stackalloc byte[sizeof(ushort)];
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
     }
 
-    private static bool TryWriteFontLibrary(
-        CpuContext ctx,
-        ulong libraryAddress,
-        ulong mspaceAddress,
-        FontMemoryDescriptor memory,
-        FontMemoryInterface iface,
-        ulong driverTableAddress)
+    private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
     {
-        Span<byte> library = stackalloc byte[FontLibraryBlockSize];
-        library.Clear();
-        BinaryPrimitives.WriteUInt16LittleEndian(library, OrbisFontLibraryMagic);
-        BinaryPrimitives.WriteUInt32LittleEndian(library[0x08..], OrbisFontLibraryFlags);
-        BinaryPrimitives.WriteUInt32LittleEndian(library[0x0C..], OrbisFontMemKindInitialized);
-        BinaryPrimitives.WriteUInt32LittleEndian(library[0x10..], memory.RegionSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x14..], memory.RegionBase);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x20..], memory.MspaceAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x28..], memory.IfaceAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x50..], iface.AllocAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x58..], iface.DeallocAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x60..], iface.ReallocAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x68..], iface.CallocAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[0x80..], driverTableAddress);
-
-        var tailAddress = libraryAddress + FontLibraryTailOffset;
-        BinaryPrimitives.WriteUInt32LittleEndian(library[(FontLibraryTailOffset + 0x04)..], FontLibraryMspaceSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[(FontLibraryTailOffset + 0x08)..], mspaceAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(library[(FontLibraryTailOffset + 0x20)..], tailAddress + 0x28);
-
-        return ctx.Memory.TryWrite(libraryAddress, library);
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
     }
 
-    private readonly record struct FontMemoryDescriptor(
-        ushort MemKind,
-        uint RegionSize,
-        ulong RegionBase,
-        ulong MspaceAddress,
-        ulong IfaceAddress);
-
-    private readonly record struct FontMemoryInterface(
-        ulong AllocAddress,
-        ulong DeallocAddress,
-        ulong ReallocAddress,
-        ulong CallocAddress);
-
-    private static void TraceFont(string message)
+    private static int SetSuccess(CpuContext ctx)
     {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FONT"), "1", StringComparison.Ordinal))
-        {
-            Console.Error.WriteLine($"[LOADER][TRACE] font.{message}");
-        }
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    private static int SetReturn(CpuContext ctx, OrbisGen2Result result)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);
+        return (int)result;
     }
 }

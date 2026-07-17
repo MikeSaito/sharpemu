@@ -36,7 +36,7 @@ public static class AmprExports
         public ulong Buffer;
         public ulong Size;
         public ulong WriteOffset;
-        public ulong PendingCommands;
+        public ulong CommandCount;
     }
 
     private sealed class CachedHostFile
@@ -401,7 +401,7 @@ public static class AmprExports
         }
 
         // Same ABI as GetSize/GetCurrentOffset: count in RAX. Observed call-site
-        // rsi/rdx are leftover registers, not out-params — do not write them.
+        // rsi/rdx are leftover registers, not out-params вЂ” do not write them.
         // Returning the real pending count matters: always-zero hid a full 0x400
         // command buffer from Astro Bot and it never called apr.submit.
         ulong pending = 0;
@@ -409,7 +409,7 @@ public static class AmprExports
         {
             lock (state)
             {
-                pending = state.PendingCommands;
+                pending = state.CommandCount;
             }
         }
 
@@ -564,7 +564,7 @@ public static class AmprExports
             if (state.WriteOffset == writeOffset)
             {
                 state.WriteOffset = 0;
-                state.PendingCommands = 0;
+                state.CommandCount = 0;
             }
         }
 
@@ -652,7 +652,7 @@ public static class AmprExports
             state.WriteOffset = writeOffset;
             if (resetPending)
             {
-                state.PendingCommands = 0;
+                state.CommandCount = 0;
             }
         }
     }
@@ -686,7 +686,7 @@ public static class AmprExports
                 state.Buffer = buffer;
                 state.Size = size;
                 state.WriteOffset = 0;
-                state.PendingCommands = 0;
+                state.CommandCount = 0;
             }
 
             return true;
@@ -915,7 +915,7 @@ public static class AmprExports
                 if (state.WriteOffset > state.Size ||
                     recordSize > state.Size - state.WriteOffset)
                 {
-                    // Tiny guest CBs (e.g. 0x400 ~= 21×0x30 ReadFile records) fill
+                    // Tiny guest CBs (e.g. 0x400 ~= 21Г—0x30 ReadFile records) fill
                     // before apr.submit. Flushing drains completion side-effects and
                     // reclaims the ring instead of silently dropping records.
                     if (attempt == 0 && state.WriteOffset > 0)
@@ -936,7 +936,7 @@ public static class AmprExports
                     }
 
                     state.WriteOffset += recordSize;
-                    state.PendingCommands++;
+                    state.CommandCount++;
                     return true;
                 }
             }

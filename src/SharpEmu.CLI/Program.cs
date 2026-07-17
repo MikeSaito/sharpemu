@@ -45,6 +45,11 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Avoid blocking full collections while guest and render threads are
+        // running, and establish the GC mode before the runtime reserves the
+        // fixed guest address-space window.
+        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
+
         try
         {
             return Run(args);
@@ -58,6 +63,11 @@ internal static partial class Program
 
     private static int Run(string[] args)
     {
+        if (Updater.TryApply(args, out var updateExitCode))
+        {
+            return updateExitCode;
+        }
+
         args = NormalizeInternalArguments(args, out var isMitigatedChild);
         if (args.Length == 0 && !isMitigatedChild)
         {
@@ -75,6 +85,142 @@ internal static partial class Program
             TryEnableConsoleFileMirror(earlyLogFilePath);
         }
 
+        if (!CheckHostArchitecture())
+        {
+            return 5;
+        }
+
+        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                ConfigureMoltenVkDefaults();
+                PreloadMacVulkanLoader();
+            }
+
+            // GLFW requires window creation and event processing on the
+            // process main thread: AppKit demands it on macOS, and X11 has a
+            // single event queue that must be serviced from the main thread
+            // (a window created and polled off it may never map, which showed
+            // as a running game with no visible window on Linux). Emulation
+            // moves to a worker thread and the main thread services the window
+            // work the video presenter posts. Windows keeps a per-thread event
+            // queue, so its window stays on the presenter's own thread.
+            var exitCode = 0;
+            HostMainThread.Enable();
+            var emulation = new Thread(() =>
+            {
+                try
+                {
+                    exitCode = RunEmulator(args, isMitigatedChild);
+                }
+                finally
+                {
+                    HostMainThread.Shutdown();
+                }
+            }, 32 * 1024 * 1024)
+            {
+                Name = "SharpEmu Emulation",
+            };
+            emulation.Start();
+            HostMainThread.Pump();
+            emulation.Join();
+            return exitCode;
+        }
+
+        return RunEmulator(args, isMitigatedChild);
+    }
+
+    /// <summary>
+    /// The supported host execution model, checked before any emulation
+    /// starts: the CPU backend executes guest x86-64 code natively, so the
+    /// host process must be x86-64 — win-x64/linux-x64 on x64 hardware, or
+    /// osx-x64 under Rosetta 2 on Apple Silicon (Rosetta translates the
+    /// whole process, so it still reports as X64 here). An arm64 process
+    /// (e.g. the osx-arm64 build) can browse the GUI but cannot run games;
+    /// failing up front distinguishes that from MoltenVK, signal-handler,
+    /// or guest-memory startup problems.
+    /// </summary>
+    private static bool CheckHostArchitecture()
+    {
+        if (RuntimeInformation.ProcessArchitecture == Architecture.X64)
+        {
+            return true;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] Unsupported process architecture " +
+            $"{RuntimeInformation.ProcessArchitecture}: guest code executes " +
+            "natively, so SharpEmu must run as an x86-64 process.");
+        if (OperatingSystem.IsMacOS())
+        {
+            Console.Error.WriteLine(
+                "[LOADER][ERROR] On Apple Silicon, use the osx-x64 build under " +
+                "Rosetta 2 (install with: softwareupdate --install-rosetta).");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Applies MoltenVK performance defaults before the Vulkan loader is
+    /// loaded. Existing user-provided values always take precedence.
+    /// </summary>
+    private static void ConfigureMoltenVkDefaults()
+    {
+        try
+        {
+            _ = MacSetEnv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+            _ = MacSetEnv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+            _ = MacSetEnv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
+            _ = MacSetEnv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Failed to set MoltenVK defaults: {exception.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Makes a Vulkan loader visible to GLFW's dlopen("libvulkan.1.dylib").
+    /// Homebrew's Vulkan libraries are arm64-only and cannot load into this
+    /// x86-64 (Rosetta 2) process, so a universal libMoltenVK.dylib placed
+    /// next to the executable (named libvulkan.1.dylib) is preloaded here;
+    /// dyld then resolves GLFW's bare-name dlopen to the loaded image.
+    /// </summary>
+    private static void PreloadMacVulkanLoader()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "libvulkan.1.dylib"),
+            Path.Combine(AppContext.BaseDirectory, "libMoltenVK.dylib"),
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".sharpemu", "x64lib", "libvulkan.1.dylib"),
+        };
+        foreach (var candidate in candidates)
+        {
+            if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out _))
+            {
+                Console.Error.WriteLine($"[LOADER][INFO] Vulkan loader preloaded: {candidate}");
+                return;
+            }
+        }
+
+        if (NativeLibrary.TryLoad("libvulkan.1.dylib", out _))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            "[LOADER][WARN] No x86-64 Vulkan loader found; video output will be unavailable. " +
+            "Place a universal libMoltenVK.dylib (from the MoltenVK releases) next to SharpEmu " +
+            "as libvulkan.1.dylib.");
+    }
+
+    private static int RunEmulator(string[] args, bool isMitigatedChild)
+    {
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
 
         if (!isMitigatedChild && TryRunMitigatedChild(args, out var childExitCode))
@@ -1204,4 +1350,7 @@ internal static partial class Program
         uint creationDisposition,
         uint flagsAndAttributes,
         nint templateFile);
+
+    [DllImport("libSystem", EntryPoint = "setenv")]
+    private static extern int MacSetEnv(string name, string value, int overwrite);
 }

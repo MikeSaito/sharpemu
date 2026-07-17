@@ -25,8 +25,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ---
 
-> [!WARNING]  
-> Currently the primary development target is Windows.
+> [!NOTE]  
+> SharpEmu supports Windows x64, Linux x64, and macOS x64. Apple Silicon Macs
+> can run the macOS x64 build through Rosetta 2.
 
 > [!WARNING]  
 > SharpEmu is an experimental PS5 emulator developed from scratch in C#. The current focus is on accuracy and infrastructure setup rather than game-specific compatibility.
@@ -39,6 +40,16 @@ This project is developed purely for research and educational purposes. There ar
 
 SharpEmu focuses exclusively on the PlayStation 5.  
 Our goal is **not** to emulate PS4 games, as there is already an excellent emulator dedicated to that platform: **ShadPS4**.
+
+## Games Tested
+
+|               Demons Souls Remake                   |                     Dreaming Sarah                         |
+| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
+| ![Bloodborne screenshot](./.github/images/demons-souls.jpg) | ![Dreaming Sarah](./.github/images/dreaming-sarah.jpg) |
+
+|                  Void Terrarium                     |                 Dead Cells                    |
+| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
+| ![Void Terrarium](./.github/images/void-terrarium.jpg) | ![Dead Cells](./.github/images/dead-cells.jpg) |
 
 ## Status
 
@@ -59,33 +70,33 @@ Current capabilities include:
 
 Some games have reached like `sceVideoOut` and AGC stages.
 
-Currently the project primarily targets Windows. Cross-platform support (Linux and macOS) is planned, but development is currently focused on Windows to simplify early-stage debugging and iteration.
+SharpEmu supports Windows, Linux, and macOS hosts. Video output uses Vulkan on
+Windows and Linux, and MoltenVK on macOS. Platform support is still experimental,
+so compatibility and performance vary by game, operating system, and GPU driver.
 
 ## Using
 
-* Build or Publish project or download in release tab.
-* Open Powershell.
-  * Run Emulator GUI.
-  * Or command: `.\SharpEmu "eboot.bin" 2>&1 | Tee-Object -FilePath "log.txt"`
+Download the release archive for your operating system, extract it, and launch
+SharpEmu with the path to a legally obtained game's `eboot.bin`.
 
-## Games Tested
+Windows PowerShell:
 
-* **Demon's Souls Remake**
-  * [Demon's Souls [PPSA01341]](https://github.com/par274/sharpemu/issues/2)
-  * Demon's Souls is now video loop. Shaders are ready to be converted to SPIR-V/Vulkan. We are continuing our work on this.
-  ![DeS videoOut submit first frame](./.github/images/des-videoout-shaders.jpg)
+```powershell
+.\SharpEmu.exe "C:\path\to\game\eboot.bin" 2>&1 |
+  Tee-Object -FilePath "SharpEmu.log"
+```
 
-* **Poppy Playtime Chapter 1**
-  * [Poppy Playtime Chapter 1 [PPSA20591]](https://github.com/par274/sharpemu/issues/3)
+Linux and macOS:
 
-* **SILENT HILL: The Short Message**
-  * [SILENT HILL: The Short Message [PPSA10112]](https://github.com/par274/sharpemu/issues/4)
+```bash
+chmod +x ./SharpEmu
 
-* **Dreaming Sarah**
-  * [Dreaming Sarah [PPSA02929]](https://github.com/par274/sharpemu/issues/9)
-  * Real texture rendering for this game;
-  ![Splash texture](./.github/images/dreaming-sarah.jpg)
+./SharpEmu "/path/to/game/eboot.bin" 2>&1 |
+  tee SharpEmu.log
+```
 
+A Vulkan-capable GPU and current graphics driver are required. The macOS
+release includes the MoltenVK Vulkan implementation.
 
 > [!IMPORTANT]  
 > This project does **not** support or condone piracy.  
@@ -94,8 +105,8 @@ Currently the project primarily targets Windows. Cross-platform support (Linux a
 
 ## Build
 
-1. Install the **.NET SDK**.
-2. Clone the repository: `git clone https://github.com/par274/sharpemu.git`
+1. Install the .NET SDK version specified in [`global.json`](./global.json).
+2. Clone the repository: `git clone https://github.com/sharpemu/sharpemu.git`
 3. Open the solution file (`SharpEmu.slnx`) in **VSCode**.
 4. Build the project: `dotnet build` or `dotnet publish`
 5. Build artifacts will be located in the `artifacts` directory.
@@ -121,7 +132,7 @@ Provided valuable references for filesystem handling and low-level C# implementa
 
 # License
 
-- [**GPL-2.0 license**](https://github.com/par274/sharpemu/blob/main/LICENSE)
+- [**GPL-2.0 license**](https://github.com/sharpemu/sharpemu/blob/main/LICENSE)
 
 ## Contributing
 
