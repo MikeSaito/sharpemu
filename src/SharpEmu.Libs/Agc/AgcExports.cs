@@ -4639,7 +4639,9 @@ public static class AgcExports
                 binding.Data,
                 binding.Writable
                     ? (address, data) => memory.TryWrite(address, data)
-                    : null);
+                    : null,
+                binding.DataFormat,
+                binding.NumberFormat);
         }
 
         return buffers;
@@ -4764,7 +4766,22 @@ public static class AgcExports
         }
 
         var source = new byte[(int)sourceByteCount];
-        if (!ctx.Memory.TryRead(descriptor.Address, source))
+        if (VulkanVideoPresenter.TryLoadHalfFloatTextureFromPublishedFloatBuffer(
+                descriptor.Address,
+                descriptor.Format,
+                descriptor.NumberType,
+                (int)sourceByteCount,
+                (address, destination) => ctx.Memory.TryRead(address, destination),
+                out var convertedHalf) &&
+            convertedHalf.Length == source.Length)
+        {
+            source = convertedHalf;
+            TraceAgcShader(
+                $"agc.texture_f32_to_f16 addr=0x{descriptor.Address:X16} " +
+                $"fmt={descriptor.Format} num={descriptor.NumberType} " +
+                $"bytes={source.Length}");
+        }
+        else if (!ctx.Memory.TryRead(descriptor.Address, source))
         {
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
@@ -4813,6 +4830,18 @@ public static class AgcExports
             Sampler: ToVulkanSampler(samplerDescriptor),
             ReloadPixels: () =>
             {
+                if (VulkanVideoPresenter.TryLoadHalfFloatTextureFromPublishedFloatBuffer(
+                        textureAddress,
+                        descriptor.Format,
+                        descriptor.NumberType,
+                        textureByteCount,
+                        (address, destination) => memory.TryRead(address, destination),
+                        out var converted) &&
+                    converted.Length == textureByteCount)
+                {
+                    return converted;
+                }
+
                 var fresh = new byte[textureByteCount];
                 return memory.TryRead(textureAddress, fresh) ? fresh : rgba;
             });
@@ -6568,11 +6597,34 @@ public static class AgcExports
         byte[] spirv,
         Gen5ShaderProgram program)
     {
-        if (spirv.Length == 0 ||
-            !string.Equals(
-                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"),
-                "1",
-                StringComparison.Ordinal))
+        if (spirv.Length == 0)
+        {
+            return;
+        }
+
+        var dumpAll = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"),
+            "1",
+            StringComparison.Ordinal);
+        var dumpFilter = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV_ADDR");
+        var addressMatched = !string.IsNullOrWhiteSpace(dumpFilter) &&
+            dumpFilter.Split(',', ';', ' ')
+                .Any(token =>
+                {
+                    var span = token.AsSpan().Trim();
+                    if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    {
+                        span = span[2..];
+                    }
+
+                    return ulong.TryParse(
+                               span,
+                               System.Globalization.NumberStyles.HexNumber,
+                               System.Globalization.CultureInfo.InvariantCulture,
+                               out var parsed) &&
+                           parsed == shaderAddress;
+                });
+        if (!dumpAll && !addressMatched)
         {
             return;
         }
@@ -6582,9 +6634,18 @@ public static class AgcExports
         var name = $"{shaderAddress:X16}-{stateFingerprint:X16}.{stage}";
         File.WriteAllBytes(Path.Combine(directory, $"{name}.spv"), spirv);
 
-        var lines = new List<string>(program.Instructions.Count + 2)
+        var opcodeCounts = program.Instructions
+            .GroupBy(static instruction => instruction.Opcode)
+            .OrderByDescending(static group => group.Count())
+            .ThenBy(static group => group.Key)
+            .Select(static group => $"{group.Key}={group.Count()}");
+        var lines = new List<string>(program.Instructions.Count + 8)
         {
             $"address=0x{program.Address:X16}",
+            $"stage={stage}",
+            $"spirv_bytes={spirv.Length}",
+            $"ir_instructions={program.Instructions.Count}",
+            $"opcode_counts={string.Join(',', opcodeCounts)}",
             "pc words opcode destinations <- sources control",
         };
         foreach (var instruction in program.Instructions)
@@ -6599,6 +6660,9 @@ public static class AgcExports
         }
 
         File.WriteAllLines(Path.Combine(directory, $"{name}.ir.txt"), lines);
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] vk.spirv_dump stage={stage} addr=0x{shaderAddress:X16} " +
+            $"bytes={spirv.Length} ir={program.Instructions.Count} file={name}");
     }
 
     private static void TraceCreateShader(ulong destinationAddress, ulong headerAddress, ulong codeAddress, string detail)
