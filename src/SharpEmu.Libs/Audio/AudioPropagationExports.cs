@@ -26,11 +26,13 @@ public static class AudioPropagationExports
     // TryAllocateHleData starts at 0x1_0000_0000 on Windows — those high
     // addresses are ignored when Sndz copies buffer slots into its own low
     // objects, leaving memset(dst=NULL, len=0x8040). Carve work + room out of
-    // the guest-provided system arena at high offsets: guest already places
-    // helpers around system+0x19D88 (inside a +0x10000 work carve).
-    private const ulong SoftWorkBufferOffset = 0x80000;
+    // the guest-provided system arena at the high end: mid-arena (+0x80000)
+    // overlapped guest tree nodes (AV @0x800FA3294 on [rcx+0x19] with rcx=0
+    // after SoftWork zeroed system+0x84648). Guest helpers already sit near
+    // system+0x19D88.
+    private const ulong SoftWorkBufferOffset = 0xE6000;
     private const int SoftWorkBufferBytes = 0xA000;
-    private const ulong SoftRoomOffset = 0x90000;
+    private const ulong SoftRoomOffset = 0xF0000;
     private const int SoftRoomBytes = OpaqueBlockSize;
     private static int _nextSystemHandle;
     private static int _nextOpaqueSerial;
@@ -825,8 +827,8 @@ public static class AudioPropagationExports
 
         // Astro Room/Source paths pass AudioPropagationContext*, which sits
         // 8 bytes before the SCE system arena stamped by SystemCreate.
-        // Guests also pass the soft work carve (system+0x80000) or room
-        // (system+0x90000) as the "system" argument after SoftWork stamps —
+        // Guests also pass the soft work carve (system+0xE6000) or room
+        // (system+0xF0000) as the "system" argument after SoftWork stamps —
         // map any address inside the system arena back to the arena base.
         if (_lastSystemAddress != 0)
         {
