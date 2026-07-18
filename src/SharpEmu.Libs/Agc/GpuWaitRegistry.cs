@@ -150,6 +150,38 @@ internal static class GpuWaitRegistry
     /// changing their labels. Missing GPU work must fail closed: advancing a
     /// command buffer without its real producer corrupts cross-queue ordering.
     /// </summary>
+    /// <summary>
+    /// Non-mutating snapshot of waiters older than maxAgeTicks.
+    /// Used to force-satisfy producerless fences without consuming the one-shot
+    /// stale-diagnostic flag.
+    /// </summary>
+    public static List<WaitingDcb>? SnapshotAged(
+        object memory,
+        long nowTicks,
+        long maxAgeTicks)
+    {
+        List<WaitingDcb>? aged = null;
+        lock (_gate)
+        {
+            foreach (var (_, list) in _waiters)
+            {
+                foreach (var waiter in list)
+                {
+                    if (!ReferenceEquals(waiter.Memory, memory) ||
+                        nowTicks - waiter.RegisteredTicks < maxAgeTicks)
+                    {
+                        continue;
+                    }
+
+                    aged ??= new List<WaitingDcb>();
+                    aged.Add(waiter);
+                }
+            }
+        }
+
+        return aged;
+    }
+
     public static List<WaitingDcb>? CollectUnreportedStale(
         object memory,
         long nowTicks,

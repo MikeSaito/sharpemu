@@ -4501,7 +4501,10 @@ public static partial class AgcExports
             destination is 1 or 2 or 4 or 5 ? destinationAddress : 0,
             destination is 1 or 2 or 4 or 5
                 ? incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint)
-                : 0);
+                : 0,
+            // Same as release_mem: CP fence labels must not sit behind the
+            // Vulkan ordered backlog or Astro compute waits stay producerless.
+            publishLabelImmediately: destination is 1 or 2 or 4 or 5);
     }
 
     private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
@@ -4691,6 +4694,19 @@ public static partial class AgcExports
              out var fallbackMs) && fallbackMs >= 0
             ? fallbackMs
             : 0L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+
+    // Producerless WAIT_REG_MEM (no ReleaseMem/WriteData producer registered for
+    // the label) cannot resume from later submits. After this grace, force the
+    // label so ACB/flip equeue can advance instead of stalling into Exit(4).
+    // Override with SHARPEMU_GPU_WAIT_ORPHAN_MS; 0 disables.
+    private static readonly long _gpuWaitOrphanTicks =
+        (long.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_ORPHAN_MS"),
+             out var orphanMs) && orphanMs >= 0
+            ? orphanMs
+            : 50L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+
+    private static int _orphanWaitForceCount;
 
     // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
     // function for both the AGC NOP-encapsulated (RWaitMem32/64) and the standard
@@ -4931,9 +4947,10 @@ public static partial class AgcExports
                     return;
                 }
 
+                var orphanForced = TryForceSatisfyOrphanGpuWaits(ctx);
                 DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
                 var after = GpuWaitRegistry.CountForMemory(ctx.Memory);
-                madeProgress = after < before;
+                madeProgress = orphanForced > 0 || after < before;
                 if (madeProgress)
                 {
                     Console.Error.WriteLine(
@@ -4952,6 +4969,97 @@ public static partial class AgcExports
                 : Math.Min(delayMilliseconds * 2, 16);
             Thread.Sleep(delayMilliseconds);
         }
+    }
+
+    private static bool HasRegisteredLabelProducer(object memory, ulong address, bool is64Bit)
+    {
+        var width = (ulong)(is64Bit ? sizeof(ulong) : sizeof(uint));
+        var waitEnd = address > ulong.MaxValue - width ? ulong.MaxValue : address + width;
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var producer = _labelProducers[index];
+                if (!ReferenceEquals(producer.Memory, memory) || producer.Length == 0)
+                {
+                    continue;
+                }
+
+                var producerEnd = producer.Address > ulong.MaxValue - producer.Length
+                    ? ulong.MaxValue
+                    : producer.Address + producer.Length;
+                if (producer.Address < waitEnd && address < producerEnd)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static int TryForceSatisfyOrphanGpuWaits(CpuContext ctx)
+    {
+        if (_gpuWaitOrphanTicks <= 0 || !_gpuWaitSuspendEnabled)
+        {
+            return 0;
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var aged = GpuWaitRegistry.SnapshotAged(
+            ctx.Memory,
+            now,
+            _gpuWaitOrphanTicks);
+        if (aged is null)
+        {
+            return 0;
+        }
+
+        var forced = 0;
+        foreach (var waiter in aged)
+        {
+            if (HasRegisteredLabelProducer(ctx.Memory, waiter.WaitAddress, waiter.Is64Bit))
+            {
+                continue;
+            }
+
+            ulong currentValue = 0;
+            if (waiter.Is64Bit)
+            {
+                if (!TryReadUInt64(ctx, waiter.WaitAddress, out currentValue))
+                {
+                    continue;
+                }
+            }
+            else if (!TryReadUInt32(ctx, waiter.WaitAddress, out var current32))
+            {
+                continue;
+            }
+            else
+            {
+                currentValue = current32;
+            }
+
+            if (GpuWaitRegistry.Compare(waiter, currentValue))
+            {
+                continue;
+            }
+
+            ForceSatisfyGpuWait(ctx, waiter, currentValue);
+            forced++;
+            var count = Interlocked.Increment(ref _orphanWaitForceCount);
+            if (count <= 16 || (count & (count - 1)) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.wait_orphan_forced #{count} " +
+                    $"label=0x{waiter.WaitAddress:X16} queue={waiter.QueueName} " +
+                    $"submission={waiter.SubmissionId} cmp={waiter.CompareFunction} " +
+                    $"ref=0x{waiter.ReferenceValue:X16} was=0x{currentValue:X16}");
+                Console.Error.Flush();
+            }
+        }
+
+        return forced;
     }
 
     /// <summary>
@@ -5023,6 +5131,11 @@ public static partial class AgcExports
 
             if (woken is null)
             {
+                if (TryForceSatisfyOrphanGpuWaits(ctx) > 0)
+                {
+                    continue;
+                }
+
                 if (_gpuWaitStaleTicks > 0 &&
                     GpuWaitRegistry.CollectUnreportedStale(
                         ctx.Memory,

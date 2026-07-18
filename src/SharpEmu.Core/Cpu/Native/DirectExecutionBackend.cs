@@ -5775,7 +5775,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				LastError = $"Execution stalled with no import progress for {stallWatchdogSeconds}s (imports={Volatile.Read(ref _importDispatchCount)}).";
 				Console.Error.WriteLine("[LOADER][ERROR] " + LastError);
 				LogStallWatchdogSnapshot();
+				Console.Error.WriteLine(
+					"[LOADER][ERROR] Stall watchdog exiting process with code 4.");
 				Console.Error.Flush();
+				try
+				{
+					Console.Out.Flush();
+				}
+				catch
+				{
+				}
 				Environment.Exit(4);
 			}
 		}))
