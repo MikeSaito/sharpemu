@@ -74,11 +74,15 @@ public static class PadExports
     // Delay after title_controller_ship before the re-armed Cross pulses.
     private static readonly int InjectTitleDelayMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_TITLE_DELAY_MS", 2_000);
     private static readonly int InjectHoldMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_HOLD_MS", 400);
+    // Longer Options hold after Cross — title "press Options / hold" prompts.
+    private static readonly int InjectOptionsHoldMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_OPTIONS_HOLD_MS", 1_500);
     private static readonly int InjectGapMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_GAP_MS", 2_000);
     private static readonly int InjectPulses = Math.Clamp(ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_PULSES", 3), 1, 32);
+    private static readonly int InjectOptionsPulses = Math.Clamp(ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_OPTIONS_PULSES", 3), 0, 32);
     private static long _injectEpochTicks;
     private static int _injectDelayMs = InjectAfterMs;
     private static int _titleInjectArmed;
+    private static int _optionsDeliveredLogged;
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -156,7 +160,8 @@ public static class PadExports
             {
                 Console.Error.WriteLine(
                     $"[LOADER][INFO] pad.inject_cross=1 after_ms={InjectAfterMs} title_delay_ms={InjectTitleDelayMs} " +
-                    $"hold_ms={InjectHoldMs} gap_ms={InjectGapMs} pulses={InjectPulses}");
+                    $"hold_ms={InjectHoldMs} options_hold_ms={InjectOptionsHoldMs} gap_ms={InjectGapMs} " +
+                    $"pulses={InjectPulses} options_pulses={InjectOptionsPulses}");
             }
         }
 
@@ -699,21 +704,27 @@ public static class PadExports
     /// Re-arm Cross inject when the title screen is ready. Early pulses from
     /// pad-open often finish before <c>title_controller_ship</c> loads.
     /// </summary>
+    /// <summary>True after title_controller_ship re-armed pad inject.</summary>
+    public static bool IsTitleInjectArmed => Volatile.Read(ref _titleInjectArmed) != 0;
+
     public static void ArmCrossInjectAfterTitle()
     {
         if (!InjectCross)
         {
+            // Still mark title ready for other subsystems (NpWebApi soft context).
+            Interlocked.Exchange(ref _titleInjectArmed, 1);
             return;
         }
 
         _injectEpochTicks = Stopwatch.GetTimestamp();
         _injectDelayMs = InjectTitleDelayMs;
         Interlocked.Exchange(ref _crossDeliveredLogged, 0);
+        Interlocked.Exchange(ref _optionsDeliveredLogged, 0);
         if (Interlocked.Exchange(ref _titleInjectArmed, 1) == 0)
         {
             Console.Error.WriteLine(
                 $"[LOADER][INFO] pad.inject_cross armed after title delay_ms={InjectTitleDelayMs} " +
-                $"pulses={InjectPulses}");
+                $"pulses={InjectPulses} options_pulses={InjectOptionsPulses} options_hold_ms={InjectOptionsHoldMs}");
         }
     }
 
@@ -737,21 +748,60 @@ public static class PadExports
             return 0;
         }
 
-        var cycle = InjectHoldMs + InjectGapMs;
-        if (cycle <= 0)
-        {
-            return 0;
-        }
-
         var sinceFirst = elapsedMs - delayMs;
-        var pulseIndex = (int)(sinceFirst / cycle);
-        if (pulseIndex < 0 || pulseIndex >= InjectPulses)
+
+        // Pre-title: short Cross pulses from pad-open.
+        if (_titleInjectArmed == 0)
+        {
+            var crossCycle = InjectHoldMs + InjectGapMs;
+            if (crossCycle <= 0)
+            {
+                return 0;
+            }
+
+            var pulseIndex = (int)(sinceFirst / crossCycle);
+            if (pulseIndex < 0 || pulseIndex >= InjectPulses)
+            {
+                return 0;
+            }
+
+            var offsetInCycle = (int)(sinceFirst % crossCycle);
+            return offsetInCycle < InjectHoldMs ? OrbisPadButton.Cross : 0;
+        }
+
+        // Title: PadRead often starts late and misses short Cross pulses.
+        // Alternate long Cross / Options holds so the first sample still hits Cross.
+        var titleCycle = InjectOptionsHoldMs + InjectGapMs;
+        if (titleCycle <= 0)
         {
             return 0;
         }
 
-        var offsetInCycle = (int)(sinceFirst % cycle);
-        return offsetInCycle < InjectHoldMs ? OrbisPadButton.Cross : 0;
+        var totalPulses = InjectPulses + InjectOptionsPulses;
+        if (totalPulses <= 0)
+        {
+            return 0;
+        }
+
+        var pulse = (int)(sinceFirst / titleCycle);
+        if (pulse < 0 || pulse >= totalPulses)
+        {
+            return 0;
+        }
+
+        var offset = (int)(sinceFirst % titleCycle);
+        if (offset >= InjectOptionsHoldMs)
+        {
+            return 0;
+        }
+
+        // Even pulses: Cross; odd: Options; pulse 0 also OR Options on last Cross.
+        if ((pulse & 1) == 0)
+        {
+            return OrbisPadButton.Cross;
+        }
+
+        return OrbisPadButton.Options;
     }
 
     private static void TracePadWrite(string api, HostInputSample sample)
@@ -759,10 +809,19 @@ public static class PadExports
         var count = Interlocked.Increment(ref _padWriteCount);
         var buttons = sample.State.Buttons;
         var cross = (buttons & OrbisPadButton.Cross) != 0;
+        var options = (buttons & OrbisPadButton.Options) != 0;
         if (cross && Interlocked.Exchange(ref _crossDeliveredLogged, 1) == 0)
         {
             Console.Error.WriteLine(
                 $"[LOADER][INFO] pad.cross_delivered api={api} buttons=0x{buttons:X} " +
+                $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
+                $"inject=0x{sample.Injected:X}");
+        }
+
+        if (options && Interlocked.Exchange(ref _optionsDeliveredLogged, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] pad.options_delivered api={api} buttons=0x{buttons:X} " +
                 $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
                 $"inject=0x{sample.Injected:X}");
         }
@@ -774,14 +833,14 @@ public static class PadExports
 
         var changed = buttons != _lastLoggedButtons;
         _lastLoggedButtons = buttons;
-        if (count > 8 && count % 5000 != 0 && !changed && !cross)
+        if (count > 8 && count % 5000 != 0 && !changed && !cross && !options)
         {
             return;
         }
 
         Console.Error.WriteLine(
             $"[LOADER][TRACE] pad.read api={api} n={count} buttons=0x{buttons:X} cross={(cross ? 1 : 0)} " +
-            $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
+            $"options={(options ? 1 : 0)} focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
             $"inject=0x{sample.Injected:X}");
     }
 

@@ -565,6 +565,48 @@ public static class FontExports
     }
 
     [SysAbiExport(
+        Nid = "1QjhKxrsOB8",
+        ExportName = "sceFontUnbindRenderer",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontUnbindRenderer(CpuContext ctx)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        if (fontAddress == 0)
+        {
+            return ctx.SetReturn(OrbisFontErrorInvalidParameter);
+        }
+
+        _ = ctx.TryWriteUInt64(fontAddress + 0x18, 0);
+        TraceFont($"unbind_renderer font=0x{fontAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "exAxkyVLt0s",
+        ExportName = "sceFontDestroyRenderer",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontDestroyRenderer(CpuContext ctx)
+    {
+        var rendererAddress = ctx[CpuRegister.Rdi];
+        TraceFont($"destroy_renderer renderer=0x{rendererAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "vzHs3C8lWJk",
+        ExportName = "sceFontCloseFont",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int FontCloseFont(CpuContext ctx)
+    {
+        var fontAddress = ctx[CpuRegister.Rdi];
+        TraceFont($"close_font font=0x{fontAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "N1EBMeGhf7E",
         ExportName = "sceFontSetScalePixel",
         Target = Generation.Gen4 | Generation.Gen5,

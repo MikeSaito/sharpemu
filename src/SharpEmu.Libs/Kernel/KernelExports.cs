@@ -398,6 +398,8 @@ public static class KernelExports
         }
 
         // Astro: LevelDocument Loaded: title_controller_ship [title]
+        // Always arm title-ready (even without pad inject) so NpWebApi soft
+        // user-context can leave the pre-title refuse path.
         if (outStr.Contains("title_controller_ship", StringComparison.Ordinal))
         {
             Pad.PadExports.ArmCrossInjectAfterTitle();

@@ -10,6 +10,7 @@ public static class NpWebApi2Exports
     private const int NpWebApi2ErrorInvalidArgument = unchecked((int)0x80553402);
 
     private static int _initialized;
+    private static int _nextUserContext;
 
     [SysAbiExport(
         Nid = "+o9816YQhqQ",
@@ -50,10 +51,33 @@ public static class NpWebApi2Exports
         LibraryName = "libSceNpWebApi2")]
     public static int NpWebApi2CreateUserContext(CpuContext ctx)
     {
-        // No PSN backend: refuse user-context creation so the title's online
-        // layer backs off instead of driving a half-created context handle.
-        TraceNpWebApi2("create-user-context", unchecked((int)ctx[CpuRegister.Rdi]), ctx[CpuRegister.Rsi]);
-        return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var userId = unchecked((int)ctx[CpuRegister.Rsi]);
+
+        // Early boot calls this with a half-ready lib ctx; soft-success there
+        // stalled RoomLoad before first frame. After title_controller_ship,
+        // hand out a stable offline handle so the title loop can leave the
+        // INVALID_ARGUMENT retry spin.
+        if (userId == 0)
+        {
+            return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        }
+
+        if (!Pad.PadExports.IsTitleInjectArmed)
+        {
+            TraceNpWebApi2("create-user-context-pre-title", libraryContextId, (ulong)(uint)userId);
+            return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        }
+
+        var handle = Interlocked.Increment(ref _nextUserContext);
+        if (handle <= 0)
+        {
+            Interlocked.Exchange(ref _nextUserContext, 1);
+            handle = 1;
+        }
+
+        TraceNpWebApi2("create-user-context", libraryContextId, (ulong)(uint)userId);
+        return ctx.SetReturn(handle);
     }
 
     [SysAbiExport(
