@@ -397,6 +397,12 @@ public static class KernelExports
             Console.WriteLine($"[DEBUG][PRINF] {outStr}");
         }
 
+        // Astro: LevelDocument Loaded: title_controller_ship [title]
+        if (outStr.Contains("title_controller_ship", StringComparison.Ordinal))
+        {
+            Pad.PadExports.ArmCrossInjectAfterTitle();
+        }
+
         ctx[CpuRegister.Rax] = (ulong)System.Text.Encoding.UTF8.GetByteCount(outStr);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

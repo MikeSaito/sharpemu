@@ -71,9 +71,14 @@ public static class PadExports
             StringComparison.Ordinal);
 
     private static readonly int InjectAfterMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_AFTER_MS", 8_000);
+    // Delay after title_controller_ship before the re-armed Cross pulses.
+    private static readonly int InjectTitleDelayMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_TITLE_DELAY_MS", 2_000);
     private static readonly int InjectHoldMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_HOLD_MS", 400);
     private static readonly int InjectGapMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_GAP_MS", 2_000);
     private static readonly int InjectPulses = Math.Clamp(ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_PULSES", 3), 1, 32);
+    private static long _injectEpochTicks;
+    private static int _injectDelayMs = InjectAfterMs;
+    private static int _titleInjectArmed;
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -130,6 +135,11 @@ public static class PadExports
         if (_padOpenedAtTicks == 0)
         {
             _padOpenedAtTicks = Stopwatch.GetTimestamp();
+            if (_injectEpochTicks == 0)
+            {
+                _injectEpochTicks = _padOpenedAtTicks;
+                _injectDelayMs = InjectAfterMs;
+            }
         }
 
         if (Interlocked.Exchange(ref _controlsAnnouncementLogged, 1) == 0)
@@ -145,8 +155,8 @@ public static class PadExports
             if (InjectCross)
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][INFO] pad.inject_cross=1 after_ms={InjectAfterMs} hold_ms={InjectHoldMs} " +
-                    $"gap_ms={InjectGapMs} pulses={InjectPulses}");
+                    $"[LOADER][INFO] pad.inject_cross=1 after_ms={InjectAfterMs} title_delay_ms={InjectTitleDelayMs} " +
+                    $"hold_ms={InjectHoldMs} gap_ms={InjectGapMs} pulses={InjectPulses}");
             }
         }
 
@@ -357,6 +367,25 @@ public static class PadExports
             (triggerMask & 0x01) != 0 ? DecodeTriggerVibration(parameter[8..64]) : null,
             (triggerMask & 0x02) != 0 ? DecodeTriggerVibration(parameter[64..120]) : null);
         return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "znaWI0gpuo8",
+        ExportName = "scePadGetTriggerEffectState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetTriggerEffectState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (!IsPrimaryPadHandle(handle))
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        // Soft success only. Astro title polls this every frame; writing the
+        // out-buffer is unsafe when rsi lands in host stack (0x7FFF…) as seen
+        // on unresolved trampoline call sites.
+        return ctx.SetReturn(0);
     }
 
     private static byte DecodeTriggerVibration(ReadOnlySpan<byte> command)
@@ -666,15 +695,44 @@ public static class PadExports
         return Math.Abs(controller - 128) > Deadzone ? controller : keyboard;
     }
 
+    /// <summary>
+    /// Re-arm Cross inject when the title screen is ready. Early pulses from
+    /// pad-open often finish before <c>title_controller_ship</c> loads.
+    /// </summary>
+    public static void ArmCrossInjectAfterTitle()
+    {
+        if (!InjectCross)
+        {
+            return;
+        }
+
+        _injectEpochTicks = Stopwatch.GetTimestamp();
+        _injectDelayMs = InjectTitleDelayMs;
+        Interlocked.Exchange(ref _crossDeliveredLogged, 0);
+        if (Interlocked.Exchange(ref _titleInjectArmed, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] pad.inject_cross armed after title delay_ms={InjectTitleDelayMs} " +
+                $"pulses={InjectPulses}");
+        }
+    }
+
     private static uint ResolveInjectedButtons(long nowTicks)
     {
-        if (!InjectCross || _padOpenedAtTicks == 0)
+        if (!InjectCross)
         {
             return 0;
         }
 
-        var elapsedMs = (nowTicks - _padOpenedAtTicks) * 1000L / Stopwatch.Frequency;
-        if (elapsedMs < InjectAfterMs)
+        var epoch = _injectEpochTicks != 0 ? _injectEpochTicks : _padOpenedAtTicks;
+        if (epoch == 0)
+        {
+            return 0;
+        }
+
+        var delayMs = _injectDelayMs > 0 ? _injectDelayMs : InjectAfterMs;
+        var elapsedMs = (nowTicks - epoch) * 1000L / Stopwatch.Frequency;
+        if (elapsedMs < delayMs)
         {
             return 0;
         }
@@ -685,7 +743,7 @@ public static class PadExports
             return 0;
         }
 
-        var sinceFirst = elapsedMs - InjectAfterMs;
+        var sinceFirst = elapsedMs - delayMs;
         var pulseIndex = (int)(sinceFirst / cycle);
         if (pulseIndex < 0 || pulseIndex >= InjectPulses)
         {

@@ -250,6 +250,20 @@ public static class PsmlExports
                ctx.TryWriteUInt64(state.DescriptorAddress + 0x38, state.BufferSizeBytes + state.ContextSizeBytes);
     }
 
+    [SysAbiExport(
+        Nid = "AHalTX9wFZY",
+        ExportName = "scePsmlMfsrGetDispatchMfsrPacketSizeInDwords",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePsml")]
+    public static int PsmlMfsrGetDispatchMfsrPacketSizeInDwords(CpuContext ctx)
+    {
+        // Astro title idle path polls this; unresolved returned 0 and spun with
+        // rdi=0x80-sized work buffers. Soft packet size keeps the path moving.
+        const int SoftPacketSizeInDwords = 0x80;
+        TracePsml($"mfsr_get_dispatch_packet_size_dwords -> 0x{SoftPacketSizeInDwords:X}");
+        return ctx.SetReturn(SoftPacketSizeInDwords);
+    }
+
     private static void TracePsml(string message)
     {
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PSML"), "1", StringComparison.Ordinal))
