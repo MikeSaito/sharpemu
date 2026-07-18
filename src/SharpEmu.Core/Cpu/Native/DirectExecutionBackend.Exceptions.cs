@@ -494,7 +494,7 @@ public sealed partial class DirectExecutionBackend
 		var ripInFontSoftAssertBand = rip >= fontSoftAssertLo && rip < fontSoftAssertHi;
 
 		// Known Astro AudioPropagation / Sndz soft-assert int 0x41 sites. These
-		// use short jz (74 xx), so the Font near-jz decoder must not guess.
+		// use short jz (74 xx), so the near-jz decoder must not guess.
 		if (TryGetAudioPropagationSoftAssertResume(rip, contextRecord, out var apResume, out var apReason))
 		{
 			softAssertEpilogue = true;
@@ -504,12 +504,28 @@ public sealed partial class DirectExecutionBackend
 		}
 		else if (fontSoftAssertArmed &&
 			ripInFontSoftAssertBand &&
-			TryGetFontSoftAssertSuccessRip(rip, out var successRip))
+			TryGetSoftAssertNearJzSuccessRip(rip, out var fontSuccessRip))
 		{
 			softAssertEpilogue = true;
-			resumeRip = successRip;
+			resumeRip = fontSuccessRip;
 			WriteCtxU64(contextRecord, CTX_RAX, 0);
 			recoverReason = $"Font soft-assert -> 0x{resumeRip:X}";
+		}
+		else if (TryGetSoftAssertNearJzSuccessRip(rip, out var softSuccessRip) &&
+			rip >= 0x0000000800000000UL &&
+			rip < 0x0000000810000000UL)
+		{
+			// Astro title soft Result: test eax,eax / jz near / int 0x41 / jmp cont.
+			// Post-Room site 0x8073CF5E3 is PriHooverSunshade.cpp:0x10A calling
+			// shared helper @0x800001AA0 (not an HLE NID); msg in r9.
+			// Fall through to the jmp (rip+2) and keep EAX — clearing it made
+			// the continuation treat a failed Result as success and quiet-exit.
+			softAssertEpilogue = true;
+			resumeRip = rip + 2;
+			var msg = ReadCtxU64(contextRecord, CTX_R9);
+			recoverReason = msg >= 0x10000
+				? $"title soft Result int41 fallthrough -> 0x{resumeRip:X} cont=0x{softSuccessRip:X} msg=0x{msg:X}"
+				: $"title soft Result int41 fallthrough -> 0x{resumeRip:X}";
 		}
 
 		if (!_ignoreGuestInt41 && !softAssertEpilogue)
@@ -713,7 +729,7 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
-	private bool TryGetFontSoftAssertSuccessRip(ulong int41Rip, out ulong successRip)
+	private bool TryGetSoftAssertNearJzSuccessRip(ulong int41Rip, out ulong successRip)
 	{
 		successRip = 0;
 		// Soft Result checks compile to: test eax,eax / jz <cont> / int 0x41 [/ jmp fail]
@@ -738,6 +754,10 @@ public sealed partial class DirectExecutionBackend
 		successRip = unchecked(int41Rip + (ulong)disp);
 		return successRip >= 0x10000;
 	}
+
+	// Compatibility alias used by Font soft-assert arming path.
+	private bool TryGetFontSoftAssertSuccessRip(ulong int41Rip, out ulong successRip) =>
+		TryGetSoftAssertNearJzSuccessRip(int41Rip, out successRip);
 
 	private unsafe static bool TryRecoverGuestAllocatorHole(
 		EXCEPTION_RECORD* exceptionRecord,

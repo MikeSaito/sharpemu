@@ -155,6 +155,52 @@ public static class AudioPropagationExports
         return true;
     }
 
+    private static int _priHooverSoftAssertPatched;
+
+    // PriHooverSunshade.cpp:0x10A post-Room soft Result:
+    //   xor eax,eax / call 0x800001AA0 / test eax,eax / jz cont / int 0x41
+    // Helper returns nonzero → int41 AV @0x8073CF5E3. Skipping int41 still
+    // quiet-exits; NOP the call so eax stays 0 and the jz success path runs.
+    internal static void TryPatchPriHooverSunshadeSoftAssert()
+    {
+        if (Interlocked.CompareExchange(ref _priHooverSoftAssertPatched, 1, 0) != 0)
+        {
+            return;
+        }
+
+        const ulong CallRip = 0x00000008073CF5D6UL;
+        Span<byte> window = stackalloc byte[16];
+        if (!TryReadGuestBytes(CallRip - 2, window))
+        {
+            Interlocked.Exchange(ref _priHooverSoftAssertPatched, 0);
+            return;
+        }
+
+        // Expect: xor eax,eax; call rel32; test eax,eax; jz near; int 0x41
+        if (window[0] != 0x31 || window[1] != 0xC0 || window[2] != 0xE8 ||
+            window[7] != 0x85 || window[8] != 0xC0 ||
+            window[9] != 0x0F || window[10] != 0x84 ||
+            window[15] != 0xCD)
+        {
+            Interlocked.Exchange(ref _priHooverSoftAssertPatched, 0);
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] audio_prop.pri_hoover_soft_assert_mismatch @0x{CallRip:X} " +
+                $"bytes={Convert.ToHexString(window)}");
+            return;
+        }
+
+        if (!TryNopGuestBytes(CallRip, 5))
+        {
+            Interlocked.Exchange(ref _priHooverSoftAssertPatched, 0);
+            Console.Error.WriteLine("[LOADER][WARN] audio_prop.pri_hoover_soft_assert_patch_failed");
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] AudioPropagation: NOP'd PriHooverSunshade soft Result call at 0x{CallRip:X} " +
+            "(PriHooverSunshade.cpp:0x10A)");
+    }
+
     // AudioPropagationContext.cpp:326/327:
     //   cmp r15d,0x10 / jne soft_assert
     //   mov r12d,ebx / movsxd rsi,ebx / cmp [r13+0x20],rsi / jne soft_assert
@@ -1192,6 +1238,7 @@ public static class AudioPropagationExports
             InstallSoftWorkBuffer(ctx, system);
             TryHealSoftAudioPointers(ctx, system);
             TryPatchSndzCookieSoftAssert();
+            TryPatchPriHooverSunshadeSoftAssert();
             if (IsLikelyGuestPointer(roomOut) &&
                 ctx.TryReadUInt64(roomOut, out var room) &&
                 IsLikelyGuestPointer(room))
