@@ -237,6 +237,13 @@ public static class AudioPropagationExports
         BinaryPrimitives.WriteUInt32LittleEndian(header, 0x41505250); // 'APRP'
         BinaryPrimitives.WriteUInt32LittleEndian(header[0x04..], kindTag);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x08..], serial);
+        // Link opaque objects back to themselves / keep non-null handle fields.
+        BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], address);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[0x18..], address);
+        if (kindTag == 0x4D4F4F52 && _lastSystemAddress != 0) // 'ROOM'
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(header[0x20..], _lastSystemAddress);
+        }
         if (!ctx.Memory.TryWrite(address, header) ||
             !ctx.TryWriteUInt64(outAddress, address))
         {
@@ -300,56 +307,35 @@ public static class AudioPropagationExports
 
     private static void WriteSystemOutCandidates(CpuContext ctx, ulong systemAddress, ulong primaryOut)
     {
-        // Always stamp the resolved out slot — stack garbage can look like a
-        // guest pointer (Astro: [rsp+0x28]=0x300000020) and must be overwritten.
-        _ = ctx.TryWriteUInt64(primaryOut, systemAddress);
-
-        var rsp = ctx[CpuRegister.Rsp];
-        ReadOnlySpan<ulong> slots =
-        [
-            rsp + 0x28,
-            rsp + 0x20,
-            rsp + 0x08,
-            rsp + 0x30,
-        ];
-
-        foreach (var slot in slots)
+        // Only the resolved out slot. Speculative rsp+ write-through of stack
+        // garbage smashed caller canaries (__stack_chk_fail after RoomCreate);
+        // empty-slot rsp stamps were not enough to avoid the NULL store AV and
+        // re-introduced the canary hit when heap write-through was re-enabled.
+        if (IsLikelyGuestPointer(primaryOut))
         {
-            if (slot == primaryOut || !IsLikelyGuestPointer(slot))
-            {
-                continue;
-            }
-
-            if (!ctx.TryReadUInt64(slot, out var existing))
-            {
-                continue;
-            }
-
-            if (existing == 0 || existing == systemAddress)
-            {
-                _ = ctx.TryWriteUInt64(slot, systemAddress);
-                continue;
-            }
-
-            // Slot holds &outLocal — write through when the pointee is empty.
-            if (IsLikelyGuestPointer(existing) &&
-                ctx.TryReadUInt64(existing, out var pointed) &&
-                (pointed == 0 || pointed == systemAddress))
-            {
-                _ = ctx.TryWriteUInt64(existing, systemAddress);
-            }
+            _ = ctx.TryWriteUInt64(primaryOut, systemAddress);
         }
     }
+
+    // Deep caller locals (out pointers). Keep the stack-protector cookie
+    // ([rbp-0x28]/[rbp-0x30]) and saved-register tail untouched.
+    private static bool IsSafeOutLocalSlot(ulong rbp, ulong address) =>
+        IsLikelyGuestPointer(rbp) &&
+        address <= rbp - 0x40 &&
+        address >= rbp - 0x200;
+
+    // Astro title stacks sit near 0x0324.... Heap system/room arenas ~0x0326....
+    private static bool IsGuestStackArena(ulong address) =>
+        address >= 0x0000_0003_2000_0000UL && address < 0x0000_0003_2500_0000UL;
 
 
     // AudioPropagationContext.cpp:327 compares [context+0x20] to numSamples.
     // Astro places Context 8 bytes before the SCE system arena, so the field is
-    // at system+0x18. Soft+0x28 is still loaded as an _Atomic_fetch_sub_4 base
-    // (HLE recovers VA 0x208). Do not plant pointer-shaped values at +0x18.
+    // at system+0x18. Leave +0x28 zero: planting the grain immediate (512) made
+    // _Atomic_fetch_sub_4 target VA 0x208.
     private static void SeedSoftSystemWorkspace(Span<byte> header, uint grainCount)
     {
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x18..], grainCount);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[0x28..], grainCount);
     }
 
     private static void StampContextGrainCount(CpuContext ctx, ulong systemAddress, uint grainCount)
@@ -420,19 +406,37 @@ public static class AudioPropagationExports
         StampContextGrainCount(ctx, memoryAddress, grainCount);
         TryPatchGrainSoftAssertBranches();
 
-        // Also stamp likely caller-frame out locals (SysV: out may not be Win64
-        // rsp+0x28). Astro RoomCreate was still seeing system=NULL after Create.
+        // Stamp empty caller-frame out locals only (deep zone; not canary tail).
         var rbp = ctx[CpuRegister.Rbp];
         if (IsLikelyGuestPointer(rbp))
         {
-            ReadOnlySpan<int> rbpOffs = [0x170, 0x168, 0x160, 0x158, 0x150, 0x148, 0x140, 0x138];
+            ReadOnlySpan<int> rbpOffs =
+            [
+                0x170, 0x168, 0x160, 0x158, 0x150, 0x148, 0x140, 0x138,
+                // AV path after RoomCreate used rdi≈rbp-0x50 with a NULL pointee.
+                0x78, 0x70, 0x68, 0x60, 0x58, 0x50, 0x48, 0x40,
+            ];
             foreach (var off in rbpOffs)
             {
                 var slot = rbp - (ulong)off;
-                if (ctx.TryReadUInt64(slot, out var existing) &&
-                    (existing == 0 || existing == memoryAddress || existing == systemOutAddress))
+                if (!IsSafeOutLocalSlot(rbp, slot) || !ctx.TryReadUInt64(slot, out var existing))
+                {
+                    continue;
+                }
+
+                if (existing == 0 || existing == memoryAddress)
                 {
                     _ = ctx.TryWriteUInt64(slot, memoryAddress);
+                    continue;
+                }
+
+                // Slot holds &outLocal — fill empty pointee (not the canary tail).
+                if (IsLikelyGuestPointer(existing) &&
+                    !IsGuestStackArena(existing) &&
+                    ctx.TryReadUInt64(existing, out var pointed) &&
+                    (pointed == 0 || pointed == memoryAddress))
+                {
+                    _ = ctx.TryWriteUInt64(existing, memoryAddress);
                 }
             }
         }

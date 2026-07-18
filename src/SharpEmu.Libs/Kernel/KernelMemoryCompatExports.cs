@@ -325,10 +325,9 @@ public static partial class KernelMemoryCompatExports
         }
     }
 
-    // Compiler-rt / libc++ atomics. Astro's AudioPropagation soft object stores
-    // grainCount (512) at +0x28; the guest then calls _Atomic_fetch_sub_4 on
-    // that value as a pointer (VA 0x208). Windows cannot back the NULL page, so
-    // unmapped low destinations soft-succeed like memset null-dst recovery.
+    // Compiler-rt / libc++ atomics. Unmapped low destinations soft-succeed
+    // (same idea as memset null-dst recovery). AudioPropagation +0x28 should be
+    // a real counter pointer; a leftover grain immediate used to hit VA 0x208.
     [SysAbiExport(
         Nid = "2HnmKiLmV6s",
         ExportName = "_Atomic_fetch_sub_4",
