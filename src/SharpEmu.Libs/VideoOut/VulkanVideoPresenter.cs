@@ -9,6 +9,7 @@ using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Bink;
 using Silk.NET.Input;
 using SharpEmu.Libs.Gpu;
+using SharpEmu.Libs.Np;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
@@ -11888,6 +11889,7 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[LOADER][INFO] Vulkan VideoOut presented first frame: " +
                     $"{presentation.Width}x{presentation.Height}");
+                NpWebApi2Exports.NotifyFirstFramePresented();
             }
 
             if (pixels is null && !_firstGuestDrawPresented)

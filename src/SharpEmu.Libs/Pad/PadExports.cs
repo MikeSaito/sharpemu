@@ -77,8 +77,8 @@ public static class PadExports
     // Longer Options hold after Cross — title "press Options / hold" prompts.
     private static readonly int InjectOptionsHoldMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_OPTIONS_HOLD_MS", 1_500);
     private static readonly int InjectGapMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_GAP_MS", 2_000);
-    private static readonly int InjectPulses = Math.Clamp(ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_PULSES", 3), 1, 32);
-    private static readonly int InjectOptionsPulses = Math.Clamp(ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_OPTIONS_PULSES", 3), 0, 32);
+    private static readonly int InjectPulses = Math.Clamp(ReadNonNegativeEnvInt("SHARPEMU_PAD_INJECT_PULSES", 3), 0, 32);
+    private static readonly int InjectOptionsPulses = Math.Clamp(ReadNonNegativeEnvInt("SHARPEMU_PAD_INJECT_OPTIONS_PULSES", 3), 0, 32);
     private static long _injectEpochTicks;
     private static int _injectDelayMs = InjectAfterMs;
     private static int _titleInjectArmed;
@@ -574,6 +574,14 @@ public static class PadExports
         }
 
         var injected = ResolveInjectedButtons(now);
+        if (InjectCross)
+        {
+            // Tab/Backspace map to Options; with ALLOW_UNFOCUSED that bit often
+            // sticks from the host IDE and opens pause on Astro's title so Cross
+            // never starts the game. Harness inject re-adds Options when wanted.
+            buttons &= ~OrbisPadButton.Options;
+        }
+
         buttons |= injected;
 
         _cachedInputState = new PadState(
@@ -750,23 +758,11 @@ public static class PadExports
 
         var sinceFirst = elapsedMs - delayMs;
 
-        // Pre-title: short Cross pulses from pad-open.
+        // Pre-title pulses often land on ps_logo / pause UI load and steal
+        // focus before title_controller_ship. Only inject after title re-arm.
         if (_titleInjectArmed == 0)
         {
-            var crossCycle = InjectHoldMs + InjectGapMs;
-            if (crossCycle <= 0)
-            {
-                return 0;
-            }
-
-            var pulseIndex = (int)(sinceFirst / crossCycle);
-            if (pulseIndex < 0 || pulseIndex >= InjectPulses)
-            {
-                return 0;
-            }
-
-            var offsetInCycle = (int)(sinceFirst % crossCycle);
-            return offsetInCycle < InjectHoldMs ? OrbisPadButton.Cross : 0;
+            return 0;
         }
 
         // Title: PadRead often starts late and misses short Cross pulses.
@@ -795,13 +791,8 @@ public static class PadExports
             return 0;
         }
 
-        // Even pulses: Cross; odd: Options; pulse 0 also OR Options on last Cross.
-        if ((pulse & 1) == 0)
-        {
-            return OrbisPadButton.Cross;
-        }
-
-        return OrbisPadButton.Options;
+        // Cross first (InjectPulses), then Options (InjectOptionsPulses).
+        return pulse < InjectPulses ? OrbisPadButton.Cross : OrbisPadButton.Options;
     }
 
     private static void TracePadWrite(string api, HostInputSample sample)
@@ -848,5 +839,11 @@ public static class PadExports
     {
         var raw = Environment.GetEnvironmentVariable(name);
         return int.TryParse(raw, out var value) && value > 0 ? value : fallback;
+    }
+
+    private static int ReadNonNegativeEnvInt(string name, int fallback)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(raw, out var value) && value >= 0 ? value : fallback;
     }
 }

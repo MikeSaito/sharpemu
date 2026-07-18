@@ -11,6 +11,15 @@ public static class NpWebApi2Exports
 
     private static int _initialized;
     private static int _nextUserContext;
+    // Soft CreateUserContext before first present stalls RoomLoad; waiting until
+    // title is too late (Astro retries ~100x between first frame and title).
+    private static int _userContextAllowed;
+
+    /// <summary>Allow offline CreateUserContext once the first non-splash frame presents.</summary>
+    public static void NotifyFirstFramePresented()
+    {
+        Interlocked.Exchange(ref _userContextAllowed, 1);
+    }
 
     [SysAbiExport(
         Nid = "+o9816YQhqQ",
@@ -54,18 +63,17 @@ public static class NpWebApi2Exports
         var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
         var userId = unchecked((int)ctx[CpuRegister.Rsi]);
 
-        // Early boot calls this with a half-ready lib ctx; soft-success there
-        // stalled RoomLoad before first frame. After title_controller_ship,
-        // hand out a stable offline handle so the title loop can leave the
-        // INVALID_ARGUMENT retry spin.
+        // Early boot soft-success stalls RoomLoad. After first non-splash
+        // present, hand out an offline handle so ProductNextLoad/title stop
+        // spinning on INVALID_ARGUMENT before the title LevelDocument loads.
         if (userId == 0)
         {
             return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
         }
 
-        if (!Pad.PadExports.IsTitleInjectArmed)
+        if (Volatile.Read(ref _userContextAllowed) == 0)
         {
-            TraceNpWebApi2("create-user-context-pre-title", libraryContextId, (ulong)(uint)userId);
+            TraceNpWebApi2("create-user-context-pre-frame", libraryContextId, (ulong)(uint)userId);
             return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
         }
 
