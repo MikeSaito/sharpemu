@@ -273,6 +273,95 @@ public static partial class KernelMemoryCompatExports
         return true;
     }
 
+    // Astro AudioPropagation SoftWork must stay under 4GB (Sndz copies buffer
+    // slots into low title objects) but must NOT live inside the guest system
+    // arena — mid/high arena carves overlap the title's in-arena tree nodes.
+    private static readonly ulong[] LowGuestHleCandidates =
+    [
+        0x0000_0000_2C00_0000UL,
+        0x0000_0000_3000_0000UL,
+        0x0000_0000_3400_0000UL,
+        0x0000_0000_3800_0000UL,
+        0x0000_0000_3C00_0000UL,
+        0x0000_0000_4000_0000UL,
+        0x0000_0000_4800_0000UL,
+        0x0000_0000_5000_0000UL,
+        0x0000_0000_5800_0000UL,
+        0x0000_0000_6000_0000UL,
+    ];
+
+    internal static bool TryAllocateHleDataInLowGuest(
+        CpuContext ctx,
+        ulong length,
+        ulong alignment,
+        out ulong address)
+    {
+        address = 0;
+        if (length == 0 || length > int.MaxValue)
+        {
+            return false;
+        }
+
+        var mappedLength = AlignUp(length, 0x1000UL);
+        var effectiveAlignment = Math.Max(alignment, 0x1000UL);
+        lock (_memoryGate)
+        {
+            foreach (var candidate in LowGuestHleCandidates)
+            {
+                var desired = AlignUp(candidate, effectiveAlignment);
+                if (desired == 0 || desired >= 0x0001_0000_0000UL)
+                {
+                    continue;
+                }
+
+                if (!KernelVirtualRangeAllocator.TryReserve(
+                        ctx,
+                        desired,
+                        mappedLength,
+                        executable: false,
+                        effectiveAlignment,
+                        allowSearch: false,
+                        allowAllocateAtAlternative: false,
+                        "hle low-guest",
+                        out address) ||
+                    address == 0 ||
+                    address >= 0x0001_0000_0000UL)
+                {
+                    address = 0;
+                    continue;
+                }
+
+                _mappedRegions[address] = new MappedRegion(
+                    address,
+                    mappedLength,
+                    OrbisProtCpuReadWrite,
+                    IsFlexible: false,
+                    IsDirect: false,
+                    DirectStart: 0);
+                break;
+            }
+
+            if (address == 0)
+            {
+                return false;
+            }
+        }
+
+        for (ulong offset = 0; offset < mappedLength;)
+        {
+            var chunkLength = (int)Math.Min((ulong)_zeroChunk.Length, mappedLength - offset);
+            if (!ctx.Memory.TryWrite(address + offset, _zeroChunk.AsSpan(0, chunkLength)))
+            {
+                address = 0;
+                return false;
+            }
+
+            offset += (ulong)chunkLength;
+        }
+
+        return true;
+    }
+
     public static bool TryUnregisterGuestPathMount(string guestMountPoint)
     {
         if (string.IsNullOrWhiteSpace(guestMountPoint))

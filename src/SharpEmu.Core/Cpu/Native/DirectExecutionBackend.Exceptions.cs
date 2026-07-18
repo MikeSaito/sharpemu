@@ -711,6 +711,24 @@ public sealed partial class DirectExecutionBackend
 
 			return true;
 		}
+		else if (target == 0x19UL &&
+			ReadCtxU64(contextRecord, CTX_RCX) == 0 &&
+			TryGetTreeNilNullChildResumeRip(rip, out resumeRip))
+		{
+			// cmp byte [rcx+0x19],0 with rcx==NULL — empty RB-tree child where a
+			// nil sentinel was expected. Take the je-nil path.
+			reason = "tree nil null-child";
+			WriteCtxU64(contextRecord, CTX_RIP, resumeRip);
+			var nilSkipCount = Interlocked.Increment(ref _audioPropSoftAssertAvSkips);
+			if (nilSkipCount <= 16 || (nilSkipCount & (nilSkipCount - 1)) == 0)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] AudioPropagation soft-assert AV skip #{nilSkipCount} at 0x{rip:X16} -> 0x{resumeRip:X} ({reason})");
+				Console.Error.Flush();
+			}
+
+			return true;
+		}
 		else
 		{
 			return false;
@@ -727,6 +745,34 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return true;
+	}
+
+	private unsafe static bool TryGetTreeNilNullChildResumeRip(ulong rip, out ulong resumeRip)
+	{
+		resumeRip = 0;
+		if (rip < 0x10000)
+		{
+			return false;
+		}
+
+		try
+		{
+			var p = (byte*)unchecked((nint)(long)rip);
+			// cmp byte ptr [rcx+0x19], 0 / je rel8
+			// byte==0 → keep walking; non-zero (nil/header) falls through.
+			// rcx==NULL is a missing nil sentinel — skip to the fall-through path.
+			if (p[0] != 0x80 || p[1] != 0x79 || p[2] != 0x19 || p[3] != 0x00 || p[4] != 0x74)
+			{
+				return false;
+			}
+
+			resumeRip = rip + 6;
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
 	}
 
 	private bool TryGetSoftAssertNearJzSuccessRip(ulong int41Rip, out ulong successRip)

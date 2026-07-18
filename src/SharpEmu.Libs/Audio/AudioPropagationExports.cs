@@ -22,18 +22,17 @@ public static class AudioPropagationExports
     // tiny scratch that collapsed to absolute VA 0x800 on the AudioOut thread.
     private const int OpaqueBlockSize = 0x10000;
     private const int OpaqueScratchOffset = 0x2000;
-    // Astro guest objects live in the low 4G arenas (~0x0324…/0x0326…). HLE
-    // TryAllocateHleData starts at 0x1_0000_0000 on Windows — those high
-    // addresses are ignored when Sndz copies buffer slots into its own low
-    // objects, leaving memset(dst=NULL, len=0x8040). Carve work + room out of
-    // the guest-provided system arena at the high end: mid-arena (+0x80000)
-    // overlapped guest tree nodes (AV @0x800FA3294 on [rcx+0x19] with rcx=0
-    // after SoftWork zeroed system+0x84648). Guest helpers already sit near
-    // system+0x19D88.
+    // SoftWork must be low-4G (Sndz copies buffer slots into title objects) but
+    // must not live inside the guest system arena: in-arena carves overlapped
+    // material/tree nodes (child at work+0x108 → AV @0x800FA32C6 on
+    // cmp byte [rcx+0x19]). Prefer a separate low-guest HLE mapping; fall back
+    // to a high-end system carve only if that allocate fails. Soft Room stays
+    // in-arena (post-Room paths expect a low pointer near system).
     private const ulong SoftWorkBufferOffset = 0xE6000;
     private const int SoftWorkBufferBytes = 0xA000;
     private const ulong SoftRoomOffset = 0xF0000;
     private const int SoftRoomBytes = OpaqueBlockSize;
+    private static int _externalSoftWorkReady;
     private static int _nextSystemHandle;
     private static int _nextOpaqueSerial;
     private static ulong _lastSystemAddress;
@@ -585,16 +584,57 @@ public static class AudioPropagationExports
         _ = ctx.Memory.TryWrite(contextAddress, context);
     }
 
-    private static void InstallSoftWorkBuffer(CpuContext ctx, ulong systemAddress)
+    private static bool IsWorkInsideSystemArena(ulong work, ulong systemAddress) =>
+        systemAddress != 0 &&
+        work >= systemAddress &&
+        work < systemAddress + SystemMemorySize;
+
+    private static ulong ResolveSoftWorkAddress(CpuContext ctx, ulong systemAddress)
     {
+        // Reuse a prior external low-guest SoftWork across SystemCreate calls.
+        if (_externalSoftWorkReady != 0 &&
+            _lastWorkAddress != 0 &&
+            IsAstroLowGuestPointer(_lastWorkAddress) &&
+            !IsWorkInsideSystemArena(_lastWorkAddress, systemAddress))
+        {
+            return _lastWorkAddress;
+        }
+
+        if (KernelMemoryCompatExports.TryAllocateHleDataInLowGuest(
+                ctx,
+                SoftWorkBufferBytes,
+                0x1000,
+                out var external) &&
+            IsAstroLowGuestPointer(external))
+        {
+            Interlocked.Exchange(ref _externalSoftWorkReady, 1);
+            TraceAudioProp($"soft_work_external=0x{external:X} bytes=0x{SoftWorkBufferBytes:X}");
+            return external;
+        }
+
         if (!IsLikelyGuestPointer(systemAddress) ||
             SoftWorkBufferOffset + (ulong)SoftWorkBufferBytes > SystemMemorySize)
+        {
+            return 0;
+        }
+
+        TraceAudioProp($"soft_work_fallback_arena system+0x{SoftWorkBufferOffset:X}");
+        return systemAddress + SoftWorkBufferOffset;
+    }
+
+    private static void InstallSoftWorkBuffer(CpuContext ctx, ulong systemAddress)
+    {
+        if (!IsLikelyGuestPointer(systemAddress))
         {
             return;
         }
 
-        // Low guest address inside the title-provided system arena.
-        var work = systemAddress + SoftWorkBufferOffset;
+        var work = ResolveSoftWorkAddress(ctx, systemAddress);
+        if (work == 0)
+        {
+            return;
+        }
+
         _lastWorkAddress = work;
 
         // Layout:
