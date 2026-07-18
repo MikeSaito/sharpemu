@@ -137,6 +137,7 @@ public static partial class KernelMemoryCompatExports
     private static ulong _threadAtexitReportCallback;
     private static ulong _threadDtorsCallback;
     private static int _nullMemsetRecoveryCount;
+    private static int _lowPageMemcpyRecoveryCount;
     private static int _lowPageAtomicRecoveryCount;
     private static int _nonCanonicalMemsetRecoveryCount;
     private static int _inaccessibleMemsetRecoveryCount;
@@ -406,20 +407,44 @@ public static partial class KernelMemoryCompatExports
 
         if (destination == 0)
         {
-            if (length <= 0x20)
+            // Astro Sndz post-Room clears ~0x8040 through a still-NULL soft
+            // buffer pointer (guest zeros soft Room, then loads r14+slot → NULL).
+            var recoveryIndex = Interlocked.Increment(ref _nullMemsetRecoveryCount);
+            if (recoveryIndex <= 8)
             {
-                var recoveryIndex = Interlocked.Increment(ref _nullMemsetRecoveryCount);
-                if (recoveryIndex <= 8)
+                Console.Error.WriteLine(
+                    $"[LOADER][WARNING] memset null-dst recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} len=0x{length:X} val=0x{value:X2}");
+            }
+
+            if (length >= 0x100UL)
+            {
+                SharpEmu.Libs.Audio.AudioPropagationExports.TraceNullMemsetContext(ctx, length);
+                SharpEmu.Libs.Audio.AudioPropagationExports.TryHealSoftAudioPointers(ctx);
+                SharpEmu.Libs.Audio.AudioPropagationExports.TryPatchSndzCookieSoftAssert();
+                var redirected = SharpEmu.Libs.Audio.AudioPropagationExports.TryRedirectNullMemset(ctx, length);
+                // With +0xC8 left as a table index (not a pointer flood) and the
+                // soft work header restored after clear, returning the low work
+                // pointer is the SysV memset contract Sndz expects.
+                if (redirected != 0 && length <= 0x20000UL)
                 {
                     Console.Error.WriteLine(
-                        $"[LOADER][WARNING] memset null-dst recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} len=0x{length:X} val=0x{value:X2}");
+                        $"[LOADER][WARNING] memset null-dst redirect → work=0x{redirected:X} len=0x{length:X}");
+                    destination = redirected;
+                    ctx[CpuRegister.Rdi] = redirected;
+                    // Fall through to the normal mapped write path below.
                 }
-
+                else
+                {
+                    SharpEmu.Libs.Audio.AudioPropagationExports.TryClearSoftWorkBuffer(ctx, length);
+                    ctx[CpuRegister.Rax] = 0;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+            }
+            else
+            {
                 ctx[CpuRegister.Rax] = 0;
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
-
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
         const ulong CanonicalUserUpper = 0x0000800000000000UL;
@@ -449,6 +474,11 @@ public static partial class KernelMemoryCompatExports
             Console.Error.WriteLine(
                 $"[LOADER][WARNING] Bad Memset Call rip=0x{ctx.Rip:X16} " +
                 $"dst=0x{destination:X16} val=0x{value:X2} len=0x{length:X}");
+            if (destination != 0 && destination < 0x1000UL)
+            {
+                SharpEmu.Libs.Audio.AudioPropagationExports.TryHealSoftAudioPointers(ctx);
+            }
+
             ctx[CpuRegister.Rax] = destination;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
@@ -509,6 +539,15 @@ public static partial class KernelMemoryCompatExports
             {
                 ArrayPool<byte>.Shared.Return(chunk);
             }
+        }
+
+        // Soft work buffer: Sndz clears ~0x8040 from the base; restore the
+        // leading self-pointer header so nested loads do not see NULL.
+        if (destination != 0 &&
+            destination == SharpEmu.Libs.Audio.AudioPropagationExports.LastSoftWorkAddress &&
+            length >= 0x100UL)
+        {
+            SharpEmu.Libs.Audio.AudioPropagationExports.RestoreSoftWorkBufferHeader(ctx);
         }
 
         ctx[CpuRegister.Rax] = destination;
@@ -1184,18 +1223,66 @@ public static partial class KernelMemoryCompatExports
     {
         var destination = ctx[CpuRegister.Rdi];
         var source = ctx[CpuRegister.Rsi];
-        var count = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
-        if (count < 0)
+        var length = ctx[CpuRegister.Rdx];
+        if (length == 0)
+        {
+            ctx[CpuRegister.Rax] = destination;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // Soft-succeed low-page src/dst (observed: src=0x800 after a NULL
+        // AudioPropagation work-buffer clear on SceSndzAudioOutMain).
+        if (destination < 0x1000UL || source < 0x1000UL)
+        {
+            var recoveryIndex = Interlocked.Increment(ref _lowPageMemcpyRecoveryCount);
+            if (recoveryIndex <= 8)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARNING] memcpy low-page recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} " +
+                    $"dst=0x{destination:X16} src=0x{source:X16} len=0x{length:X}");
+            }
+
+            SharpEmu.Libs.Audio.AudioPropagationExports.TryHealSoftAudioPointers(ctx);
+            ctx[CpuRegister.Rax] = destination;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (length > 2UL * 1024 * 1024 * 1024 ||
+            ulong.MaxValue - destination < length - 1 ||
+            ulong.MaxValue - source < length - 1)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var payload = GC.AllocateUninitializedArray<byte>(count);
-        if (count > 0 && (!TryReadCompat(ctx, source, payload) || !TryWriteCompat(ctx, destination, payload)))
+        // Chunked copy — avoid a single giant GC allocation on large HLE memcpy
+        // (forced off host CRT / rep-movsb so low-page soft-recovery can run).
+        var chunkLength = (int)Math.Min(length, (ulong)MemsetChunkSize);
+        var chunk = ArrayPool<byte>.Shared.Rent(chunkLength);
+        try
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            ulong remaining = length;
+            ulong srcCursor = source;
+            ulong dstCursor = destination;
+            while (remaining > 0)
+            {
+                var take = (int)Math.Min((ulong)chunkLength, remaining);
+                var span = chunk.AsSpan(0, take);
+                if (!TryReadCompat(ctx, srcCursor, span) || !TryWriteCompat(ctx, dstCursor, span))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                srcCursor += (ulong)take;
+                dstCursor += (ulong)take;
+                remaining -= (ulong)take;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(chunk);
         }
 
+        ctx[CpuRegister.Rax] = destination;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

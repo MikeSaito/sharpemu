@@ -546,6 +546,24 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private unsafe static bool TryWriteHostDword(ulong address, uint value)
+	{
+		if (address < 0x10000)
+		{
+			return false;
+		}
+
+		try
+		{
+			Marshal.WriteInt32((nint)address, unchecked((int)value));
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
 	private unsafe bool TryGetAudioPropagationSoftAssertResume(
 		ulong int41Rip,
 		void* contextRecord,
@@ -602,17 +620,16 @@ public sealed partial class DirectExecutionBackend
 		void* contextRecord,
 		ulong rip)
 	{
-		if (exceptionRecord->NumberParameters < 2 ||
-			exceptionRecord->ExceptionInformation[1] != ulong.MaxValue)
-		{
-			return false;
-		}
-
 		ulong resumeRip = 0;
 		string reason;
+		var target = exceptionRecord->NumberParameters >= 2
+			? exceptionRecord->ExceptionInformation[1]
+			: 0UL;
+
 		// AudioPropagationContext.cpp:326/327 soft-assert epilogue (int41 / Result).
-		if ((rip >= 0x0000000800F612F0UL && rip < 0x0000000800F613B0UL) ||
-			(rip >= 0x0000000800F98385UL && rip < 0x0000000800F98420UL))
+		if (target == ulong.MaxValue &&
+			((rip >= 0x0000000800F612F0UL && rip < 0x0000000800F613B0UL) ||
+			 (rip >= 0x0000000800F98385UL && rip < 0x0000000800F98420UL)))
 		{
 			var contextObject = ReadCtxU64(contextRecord, CTX_R13);
 			var expectedGrains = ReadCtxU64(contextRecord, CTX_RSI);
@@ -626,6 +643,57 @@ public sealed partial class DirectExecutionBackend
 				? 0x0000000800F6128BUL
 				: 0x0000000800F982FBUL;
 			reason = "AudioPropagation grain soft-assert";
+		}
+		else if (rip == 0x00000008000006A1UL)
+		{
+			// Early soft Result: mov edx,1 / xor eax,eax / call / test / je /
+			// int 0x41 / jmp cont. Seen right after soft Room memset when the
+			// follow-up path still fails; resume at the shared continuation.
+			resumeRip = 0x0000000800000654UL;
+			reason = "post-Room soft Result int41";
+			WriteCtxU64(contextRecord, CTX_RAX, 0);
+			WriteCtxU64(contextRecord, CTX_RIP, resumeRip);
+			var int41Count = Interlocked.Increment(ref _audioPropSoftAssertAvSkips);
+			if (int41Count <= 16 || (int41Count & (int41Count - 1)) == 0)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] AudioPropagation soft-assert AV skip #{int41Count} at 0x{rip:X16} -> 0x{resumeRip:X} ({reason})");
+				Console.Error.Flush();
+			}
+
+			return true;
+		}
+		else if (rip == 0x0000000800F7CCF9UL)
+		{
+			// movsxd rcx,[rax+0xC8]; shl rcx,5; mov rbx,[rax+rcx+0x90]
+			// Soft pointer floods used to store a VA in +0xC8 (table index).
+			// Reset index to 0, supply [rax+0x90] in rbx, continue.
+			var obj = ReadCtxU64(contextRecord, CTX_RAX);
+			ulong entry = obj;
+			if (obj >= 0x0100_0000UL && obj < 0x0001_0000_0000UL)
+			{
+				_ = TryWriteHostDword(obj + 0xC8, 0);
+				if (TryReadHostQword(obj + 0x90, out var slot) &&
+					slot >= 0x0100_0000UL && slot < 0x0001_0000_0000UL)
+				{
+					entry = slot;
+				}
+			}
+
+			WriteCtxU64(contextRecord, CTX_RBX, entry);
+			WriteCtxU64(contextRecord, CTX_RCX, 0);
+			resumeRip = 0x0000000800F7CD01UL;
+			reason = "Sndz post-Room table index load";
+			WriteCtxU64(contextRecord, CTX_RIP, resumeRip);
+			var tableSkipCount = Interlocked.Increment(ref _audioPropSoftAssertAvSkips);
+			if (tableSkipCount <= 16 || (tableSkipCount & (tableSkipCount - 1)) == 0)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] AudioPropagation soft-assert AV skip #{tableSkipCount} at 0x{rip:X16} -> 0x{resumeRip:X} ({reason}) rbx=0x{entry:X}");
+				Console.Error.Flush();
+			}
+
+			return true;
 		}
 		else
 		{
