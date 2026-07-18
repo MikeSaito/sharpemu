@@ -16,7 +16,11 @@ public static class AudioPropagationExports
     private const ulong SystemMemorySize = 0x100000;
     private const ulong SystemMemoryAlignment = 0x10000;
     private const int SystemBlockSize = 0x100;
-    private const int OpaqueBlockSize = 0x100;
+    // Astro post-Room path touches fields past +0x100 (stack held room+0x130).
+    // Undersized soft rooms left nested pointer slots as NULL → write AV at
+    // 0x80000048F (mov [rsi], rdx after mov rsi,[rsi]).
+    private const int OpaqueBlockSize = 0x1000;
+    private const int OpaqueScratchOffset = 0x800;
     private static int _nextSystemHandle;
     private static int _nextOpaqueSerial;
     private static ulong _lastSystemAddress;
@@ -232,18 +236,32 @@ public static class AudioPropagationExports
             serial = 1;
         }
 
+        var scratch = address + (ulong)OpaqueScratchOffset;
         Span<byte> header = stackalloc byte[OpaqueBlockSize];
         header.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(header, 0x41505250); // 'APRP'
         BinaryPrimitives.WriteUInt32LittleEndian(header[0x04..], kindTag);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x08..], serial);
-        // Link opaque objects back to themselves / keep non-null handle fields.
+
+        // Nested handle fields: point into a scratch region inside the same
+        // allocation so double-derefs do not collapse to NULL before stores.
+        for (var off = 0x10; off < 0x200; off += sizeof(ulong))
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(header[off..], scratch);
+        }
+
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], address);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x18..], address);
         if (kindTag == 0x4D4F4F52 && _lastSystemAddress != 0) // 'ROOM'
         {
             BinaryPrimitives.WriteUInt64LittleEndian(header[0x20..], _lastSystemAddress);
         }
+
+        for (var off = OpaqueScratchOffset; off < OpaqueScratchOffset + 0x100; off += sizeof(ulong))
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(header[off..], scratch);
+        }
+
         if (!ctx.Memory.TryWrite(address, header) ||
             !ctx.TryWriteUInt64(outAddress, address))
         {
@@ -331,11 +349,39 @@ public static class AudioPropagationExports
 
     // AudioPropagationContext.cpp:327 compares [context+0x20] to numSamples.
     // Astro places Context 8 bytes before the SCE system arena, so the field is
-    // at system+0x18. Leave +0x28 zero: planting the grain immediate (512) made
+    // at system+0x18. Leave +0x28 zero: planting the sample-count immediate made
     // _Atomic_fetch_sub_4 target VA 0x208.
-    private static void SeedSoftSystemWorkspace(Span<byte> header, uint grainCount)
+    private static void SeedSoftSystemWorkspace(Span<byte> header, ulong systemAddress, uint grainCount)
     {
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x18..], grainCount);
+
+        // Context object lives at system-8; keep a few early pointer slots
+        // non-null so post-Room helpers do not store through NULL.
+        var scratch = systemAddress + 0x80;
+        for (var off = 0x30; off < 0x80; off += sizeof(ulong))
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(header[off..], scratch);
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(header[0x80..], scratch);
+    }
+
+    private static void SeedSoftContextPrefix(CpuContext ctx, ulong systemAddress, uint grainCount)
+    {
+        if (systemAddress < 8)
+        {
+            return;
+        }
+
+        var contextAddress = systemAddress - 8;
+        Span<byte> context = stackalloc byte[0x40];
+        context.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(context, systemAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(context[0x08..], contextAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(context[0x10..], systemAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(context[0x20..], grainCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(context[0x28..], systemAddress + 0x80);
+        _ = ctx.Memory.TryWrite(contextAddress, context);
     }
 
     private static void StampContextGrainCount(CpuContext ctx, ulong systemAddress, uint grainCount)
@@ -393,13 +439,14 @@ public static class AudioPropagationExports
         header.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x08..], handle);
         BinaryPrimitives.WriteUInt64LittleEndian(header[0x10..], paramAddress);
-        SeedSoftSystemWorkspace(header, grainCount);
+        SeedSoftSystemWorkspace(header, memoryAddress, grainCount);
 
         if (!ctx.Memory.TryWrite(memoryAddress, header))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        SeedSoftContextPrefix(ctx, memoryAddress, grainCount);
         WriteSystemOutCandidates(ctx, memoryAddress, systemOutAddress);
         _lastSystemAddress = memoryAddress;
         _lastGrainCount = grainCount;
@@ -453,6 +500,28 @@ public static class AudioPropagationExports
         LibraryName = "libSceAudioPropagation")]
     public static int AudioPropagationSystemDestroy(CpuContext ctx) => SoftOkTrace(ctx, "system_destroy");
 
+    private static ulong ResolveSystemArena(ulong candidate)
+    {
+        if (candidate == 0)
+        {
+            return _lastSystemAddress;
+        }
+
+        // Astro Room/Source paths pass AudioPropagationContext*, which sits
+        // 8 bytes before the SCE system arena stamped by SystemCreate.
+        if (_lastSystemAddress != 0)
+        {
+            if (candidate == _lastSystemAddress ||
+                candidate + 8 == _lastSystemAddress ||
+                candidate == _lastSystemAddress - 8)
+            {
+                return _lastSystemAddress;
+            }
+        }
+
+        return candidate;
+    }
+
     // RoomCreate(system, roomOut, settings): unresolved returned 0x80020002 and
     // tripped AudioPropagationRoom.cpp soft-assert after SystemCreate succeeded.
     [SysAbiExport(
@@ -462,13 +531,8 @@ public static class AudioPropagationExports
         LibraryName = "libSceAudioPropagation")]
     public static int AudioPropagationRoomCreate(CpuContext ctx)
     {
-        var system = ctx[CpuRegister.Rdi];
+        var system = ResolveSystemArena(ctx[CpuRegister.Rdi]);
         var roomOut = ctx[CpuRegister.Rsi];
-        if (system == 0)
-        {
-            system = _lastSystemAddress;
-        }
-
         if (system == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -500,13 +564,8 @@ public static class AudioPropagationExports
         LibraryName = "libSceAudioPropagation")]
     public static int AudioPropagationSourceCreate(CpuContext ctx)
     {
-        var system = ctx[CpuRegister.Rdi];
+        var system = ResolveSystemArena(ctx[CpuRegister.Rdi]);
         var sourceOut = ctx[CpuRegister.Rsi];
-        if (system == 0)
-        {
-            system = _lastSystemAddress;
-        }
-
         if (system == 0)
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -535,7 +594,7 @@ public static class AudioPropagationExports
         LibraryName = "libSceAudioPropagation")]
     public static int AudioPropagationPortalCreate(CpuContext ctx)
     {
-        var system = ctx[CpuRegister.Rdi];
+        var system = ResolveSystemArena(ctx[CpuRegister.Rdi]);
         var portalOut = ctx[CpuRegister.Rsi];
         if (system == 0)
         {
