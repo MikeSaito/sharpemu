@@ -125,6 +125,7 @@ public static partial class AgcExports
     private const uint DbDepthView = 0x002;
     private const uint DbDepthSizeXy = 0x007;
     private const uint DbDepthClear = 0x00B;
+    private const uint DbStencilClear = 0x00A;
     private const uint DbZInfo = 0x010;
     private const uint DbZReadBase = 0x012;
     private const uint DbZWriteBase = 0x014;
@@ -4697,6 +4698,23 @@ public static partial class AgcExports
         System.Diagnostics.Debug.Assert(depth.SwizzleMode == 24u);
         System.Diagnostics.Debug.Assert(depth.Address == 0x0000_0201_2345_6700UL);
         System.Diagnostics.Debug.Assert(depth.ClearDepth == 1f);
+
+        // Astro leaves SIZE_XY at clear-state 0 and packs 1920x1080 into the
+        // slot that normally holds DB_DEPTH_CLEAR (0x00B).
+        registers = new Dictionary<uint, uint>
+        {
+            [DbDepthControl] = 0x70u,
+            [DbDepthSizeXy] = 0u,
+            [DbDepthClear] = 1919u | (1079u << 16),
+            [DbStencilClear] = BitConverter.SingleToUInt32Bits(1f),
+            [DbZInfo] = 0xA0000003u,
+            [DbZReadBase] = 0x0512_A300u,
+            [DbZWriteBase] = 0x0512_A300u,
+        };
+        depth = DecodeDepthTarget(registers);
+        System.Diagnostics.Debug.Assert(depth is not null);
+        System.Diagnostics.Debug.Assert(depth.Width == 1920 && depth.Height == 1080);
+        System.Diagnostics.Debug.Assert(depth.ClearDepth == 1f);
     }
 #endif
 
@@ -5842,6 +5860,34 @@ public static partial class AgcExports
                         {
                             Depth = renderState.Depth with { WriteEnable = false },
                         };
+                    }
+                    else if (!translatedDepthTarget.ReadOnly &&
+                             translatedDepthTarget.WriteAddress != 0 &&
+                             !renderState.Depth.WriteEnable &&
+                             !renderState.Depth.TestEnable &&
+                             !renderState.Depth.ClearEnable)
+                    {
+                        // Targetless depth prepass with a writable DB base but
+                        // odd/cleared Z flags (Astro seq=20: CONTROL=0x70).
+                        // Forcing Z-write of vertex depth produced an all-zero
+                        // DB (near plane); treat it as a DB clear to the guest
+                        // clear value so later ImageLoads see non-empty R32.
+                        renderState = renderState with
+                        {
+                            Depth = new GuestDepthState(
+                                TestEnable: false,
+                                WriteEnable: false,
+                                renderState.Depth.CompareOp != 0
+                                    ? renderState.Depth.CompareOp
+                                    : 7u,
+                                ClearEnable: true),
+                        };
+                        TraceAgcShader(
+                            $"agc.targetless_depth_prepass seq={drawSequence} " +
+                            $"depth=0x{translatedDepthTarget.Address:X16}:" +
+                            $"{translatedDepthTarget.Width}x{translatedDepthTarget.Height}:" +
+                            $"fmt{translatedDepthTarget.GuestFormat}/sw{translatedDepthTarget.SwizzleMode} " +
+                            $"es=0x{exportShaderAddress:X16} ps=0x{pixelShaderAddress:X16}");
                     }
 
                     TraceDrawCompact(
@@ -7304,16 +7350,7 @@ public static partial class AgcExports
     private static GuestDepthTarget? DecodeDepthTarget(
         IReadOnlyDictionary<uint, uint> registers)
     {
-        var depthState = DecodeDepthState(registers);
-        if (!depthState.TestEnable &&
-            !depthState.WriteEnable &&
-            !depthState.ClearEnable)
-        {
-            return null;
-        }
-
-        if (!registers.TryGetValue(DbZInfo, out var zInfo) ||
-            !registers.TryGetValue(DbDepthSizeXy, out var sizeXy))
+        if (!registers.TryGetValue(DbZInfo, out var zInfo))
         {
             return null;
         }
@@ -7335,6 +7372,24 @@ public static partial class AgcExports
             return null;
         }
 
+        var depthState = DecodeDepthState(registers);
+        // A bound DB surface is still a depth target for targetless prepasses
+        // even when DB_DEPTH_CONTROL leaves Z_ENABLE/Z_WRITE clear (Astro seq=20
+        // uses CONTROL=0x70 with ZFUNC=ALWAYS). Color draws still gate attach
+        // through ShouldAttachGuestDepth on the enable flags.
+        if (!depthState.TestEnable &&
+            !depthState.WriteEnable &&
+            !depthState.ClearEnable &&
+            writeAddress == 0)
+        {
+            return null;
+        }
+
+        if (!TryGetDepthSizeXy(registers, out var sizeXy, out var sizeFromClearSlot))
+        {
+            return null;
+        }
+
         var width = (sizeXy & 0x3FFFu) + 1;
         var height = ((sizeXy >> 16) & 0x3FFFu) + 1;
         if (width == 0 || height == 0 || width > 16384 || height > 16384)
@@ -7343,9 +7398,19 @@ public static partial class AgcExports
         }
 
         registers.TryGetValue(DbDepthView, out var depthView);
-        var clearDepth = registers.TryGetValue(DbDepthClear, out var clearBits)
-            ? BitConverter.UInt32BitsToSingle(clearBits)
-            : 1f;
+        var clearDepth = 1f;
+        if (!sizeFromClearSlot &&
+            registers.TryGetValue(DbDepthClear, out var clearBits))
+        {
+            clearDepth = BitConverter.UInt32BitsToSingle(clearBits);
+        }
+        else if (sizeFromClearSlot &&
+                 registers.TryGetValue(DbStencilClear, out var stencilOrClearBits))
+        {
+            // When 0x00B held the packed size, 0x00A often carries 1.0f.
+            clearDepth = BitConverter.UInt32BitsToSingle(stencilOrClearBits);
+        }
+
         if (!float.IsFinite(clearDepth) || clearDepth < 0f || clearDepth > 1f)
         {
             clearDepth = 1f;
@@ -7360,6 +7425,50 @@ public static partial class AgcExports
             (zInfo >> 4) & 0x1Fu,
             clearDepth,
             ReadOnly: (depthView & (1u << 24)) != 0 || writeAddress == 0);
+    }
+
+    /// <summary>
+    /// Gen5 streams sometimes leave DB_DEPTH_SIZE_XY at clear-state 0 and pack
+    /// (width-1)|(height-1)&lt;&lt;16 into the register that otherwise holds
+    /// DB_DEPTH_CLEAR (0x00B). Prefer a dimension-shaped 0x00B over a literal
+    /// 1x1 size from a zeroed SIZE_XY.
+    /// </summary>
+    private static bool TryGetDepthSizeXy(
+        IReadOnlyDictionary<uint, uint> registers,
+        out uint sizeXy,
+        out bool sizeFromClearSlot)
+    {
+        sizeFromClearSlot = false;
+        registers.TryGetValue(DbDepthSizeXy, out sizeXy);
+        if (LooksLikeDepthSizeXy(sizeXy))
+        {
+            return true;
+        }
+
+        if (registers.TryGetValue(DbDepthClear, out var clearOrSize) &&
+            LooksLikeDepthSizeXy(clearOrSize))
+        {
+            sizeXy = clearOrSize;
+            sizeFromClearSlot = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeDepthSizeXy(uint sizeXy)
+    {
+        if (sizeXy == 0)
+        {
+            return false;
+        }
+
+        var width = (sizeXy & 0x3FFFu) + 1;
+        var height = ((sizeXy >> 16) & 0x3FFFu) + 1;
+        return width >= 64 &&
+               height >= 64 &&
+               width <= 8192 &&
+               height <= 8192;
     }
 
     // PA_SU_SC_MODE_CNTL (context register 0x205) carries face culling, the

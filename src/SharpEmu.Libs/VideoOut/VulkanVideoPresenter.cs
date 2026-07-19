@@ -10250,10 +10250,17 @@ internal static unsafe class VulkanVideoPresenter
                     if (clearDepthForDraw)
                     {
                         depth.InitializationSource = "guest-depth-clear";
+                        // Astro lighting ImageLoads DB memory as R32 at the same
+                        // VA. Publish after a DB clear so fmt4/num7 loads see it.
+                        PublishDepthBufferAsR32(depth);
                     }
                     else if (draw.RenderState.Depth.WriteEnable)
                     {
                         depth.InitializationSource = "translated-depth-write";
+                        // Astro lighting ImageLoads DB memory as R32 storage at the
+                        // same VA. Publish a color twin so those loads see the
+                        // depth prepass instead of an empty R32 allocation.
+                        PublishDepthBufferAsR32(depth);
                     }
                 }
                 MarkSampledImagesInitialized(resources);
@@ -11306,6 +11313,201 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             return resource;
+        }
+
+        /// <summary>
+        /// Copy a written DB surface into an R32F guest image at the same VA so
+        /// later ImageLoad/storage descriptors (Gen5 fmt4/num7) observe the
+        /// depth values the hardware would alias from DB memory.
+        /// D32 and R32 are not CopyImage-compatible format classes; go through
+        /// a device-local staging buffer instead.
+        /// </summary>
+        private void PublishDepthBufferAsR32(GuestDepthResource depth)
+        {
+            if (depth.Address == 0 || depth.Width == 0 || depth.Height == 0)
+            {
+                return;
+            }
+
+            var colorTarget = new GuestRenderTarget(
+                depth.Address,
+                depth.Width,
+                depth.Height,
+                Format: 4,
+                NumberType: 7);
+            var color = GetOrCreateGuestImage(colorTarget, Format.R32Sfloat);
+            if (color.Width != depth.Width || color.Height != depth.Height)
+            {
+                return;
+            }
+
+            var byteCount = (ulong)depth.Width * depth.Height * 4UL;
+            var transferBuffer = CreateBuffer(
+                byteCount,
+                BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.DeviceLocalBit,
+                out var transferMemory);
+            _batchRetireBuffers.Add((transferBuffer, transferMemory));
+
+            var depthToTransfer = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.DepthStencilAttachmentWriteBit,
+                DstAccessMask = AccessFlags.TransferReadBit,
+                OldLayout = depth.Layout,
+                NewLayout = ImageLayout.TransferSrcOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = depth.Image,
+                SubresourceRange = new ImageSubresourceRange(
+                    ImageAspectFlags.DepthBit, 0, 1, 0, 1),
+            };
+            // GetOrCreateGuestImage leaves new images in ShaderReadOnlyOptimal
+            // via TransitionNewGuestImageToSampled even while Initialized=false.
+            var colorToTransfer = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+                DstAccessMask = AccessFlags.TransferWriteBit,
+                OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                NewLayout = ImageLayout.TransferDstOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = color.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            var imageBarriers = stackalloc ImageMemoryBarrier[2];
+            imageBarriers[0] = depthToTransfer;
+            imageBarriers[1] = colorToTransfer;
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.LateFragmentTestsBit |
+                PipelineStageFlags.EarlyFragmentTestsBit |
+                PipelineStageFlags.FragmentShaderBit |
+                PipelineStageFlags.ComputeShaderBit,
+                PipelineStageFlags.TransferBit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                2,
+                imageBarriers);
+
+            var depthCopy = new BufferImageCopy
+            {
+                BufferOffset = 0,
+                BufferRowLength = 0,
+                BufferImageHeight = 0,
+                ImageSubresource = new ImageSubresourceLayers(
+                    ImageAspectFlags.DepthBit, 0, 0, 1),
+                ImageOffset = default,
+                ImageExtent = new Extent3D(depth.Width, depth.Height, 1),
+            };
+            _vk.CmdCopyImageToBuffer(
+                _commandBuffer,
+                depth.Image,
+                ImageLayout.TransferSrcOptimal,
+                transferBuffer,
+                1,
+                &depthCopy);
+
+            var bufferBarrier = new BufferMemoryBarrier
+            {
+                SType = StructureType.BufferMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.TransferReadBit,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Buffer = transferBuffer,
+                Offset = 0,
+                Size = byteCount,
+            };
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TransferBit,
+                PipelineStageFlags.TransferBit,
+                0,
+                0,
+                null,
+                1,
+                &bufferBarrier,
+                0,
+                null);
+
+            var colorCopy = new BufferImageCopy
+            {
+                BufferOffset = 0,
+                BufferRowLength = 0,
+                BufferImageHeight = 0,
+                ImageSubresource = new ImageSubresourceLayers(
+                    ImageAspectFlags.ColorBit, 0, 0, 1),
+                ImageOffset = default,
+                ImageExtent = new Extent3D(depth.Width, depth.Height, 1),
+            };
+            _vk.CmdCopyBufferToImage(
+                _commandBuffer,
+                transferBuffer,
+                color.Image,
+                ImageLayout.TransferDstOptimal,
+                1,
+                &colorCopy);
+
+            var depthBack = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferReadBit,
+                DstAccessMask = AccessFlags.DepthStencilAttachmentReadBit |
+                                AccessFlags.DepthStencilAttachmentWriteBit |
+                                AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.TransferSrcOptimal,
+                NewLayout = ImageLayout.DepthStencilAttachmentOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = depth.Image,
+                SubresourceRange = new ImageSubresourceRange(
+                    ImageAspectFlags.DepthBit, 0, 1, 0, 1),
+            };
+            var colorBack = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+                OldLayout = ImageLayout.TransferDstOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = color.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            imageBarriers[0] = depthBack;
+            imageBarriers[1] = colorBack;
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TransferBit,
+                PipelineStageFlags.EarlyFragmentTestsBit |
+                PipelineStageFlags.LateFragmentTestsBit |
+                PipelineStageFlags.FragmentShaderBit |
+                PipelineStageFlags.ComputeShaderBit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                2,
+                imageBarriers);
+
+            depth.Layout = ImageLayout.DepthStencilAttachmentOptimal;
+            color.Initialized = true;
+            color.InitialUploadPending = false;
+            if (_batchTraceImages.All(image => image.Address != color.Address))
+            {
+                _batchTraceImages.Add(color);
+            }
+
+            TraceVulkanShader(
+                $"vk.depth_publish_r32 addr=0x{depth.Address:X16} " +
+                $"{depth.Width}x{depth.Height}");
         }
 
         private static void PrepareFirstUseDepth(
