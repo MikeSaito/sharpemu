@@ -5698,7 +5698,12 @@ internal static unsafe class VulkanVideoPresenter
                         $"globals={resources.GlobalMemoryBuffers.Length}");
                 }
 
-                CreateComputePipeline(resources, dispatch.ComputeSpirv);
+                if (!TryCreateComputePipeline(resources, dispatch.ComputeSpirv, out var pipelineError))
+                {
+                    throw new InvalidOperationException(
+                        $"vkCreateComputePipelines failed for cs=0x{dispatch.ShaderAddress:X16}: {pipelineError}");
+                }
+
                 if (traceResources)
                 {
                     TraceVulkanShader("vk.compute_resources pipeline ready");
@@ -6305,6 +6310,18 @@ internal static unsafe class VulkanVideoPresenter
             TranslatedDrawResources resources,
             byte[] computeSpirv)
         {
+            if (!TryCreateComputePipeline(resources, computeSpirv, out var error))
+            {
+                throw new InvalidOperationException(error);
+            }
+        }
+
+        private bool TryCreateComputePipeline(
+            TranslatedDrawResources resources,
+            byte[] computeSpirv,
+            out string error)
+        {
+            error = string.Empty;
             var pipelineKey = new ComputePipelineKey(
                 GetShaderDigest(computeSpirv),
                 GetResourceLayoutKey(resources));
@@ -6312,13 +6329,15 @@ internal static unsafe class VulkanVideoPresenter
             {
                 resources.Pipeline = cachedPipeline;
                 resources.PipelineCached = true;
-                return;
+                return true;
             }
 
-            var computeModule = CreateShaderModule(computeSpirv);
-            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            ShaderModule computeModule = default;
+            byte* entryPoint = null;
             try
             {
+                computeModule = CreateShaderModule(computeSpirv);
+                entryPoint = (byte*)SilkMarshal.StringToPtr("main");
                 var stage = new PipelineShaderStageCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageCreateInfo,
@@ -6334,15 +6353,19 @@ internal static unsafe class VulkanVideoPresenter
                     Layout = resources.PipelineLayout,
                 };
                 Pipeline pipeline;
-                Check(
-                    _vk.CreateComputePipelines(
-                        _device,
-                        _pipelineCache,
-                        1,
-                        &pipelineInfo,
-                        null,
-                        out pipeline),
-                    "vkCreateComputePipelines(translated)");
+                var result = _vk.CreateComputePipelines(
+                    _device,
+                    _pipelineCache,
+                    1,
+                    &pipelineInfo,
+                    null,
+                    out pipeline);
+                if (result != Result.Success)
+                {
+                    error = $"vkCreateComputePipelines returned {result}";
+                    return false;
+                }
+
                 MarkPipelineCacheDirty();
                 resources.Pipeline = pipeline;
                 resources.PipelineCached = true;
@@ -6351,11 +6374,29 @@ internal static unsafe class VulkanVideoPresenter
                     pipeline.Handle,
                     $"SharpEmu compute cs={computeSpirv.Length}b");
                 _computePipelines.Add(pipelineKey, pipeline);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                // Some translated modules trip a native AV inside the driver
+                // during pipeline create (Astro cs=0x500A44A00). Soft-skip.
+                error = exception.GetType().Name + ": " + exception.Message;
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] vk.compute_pipeline_failed " +
+                    $"spirv={computeSpirv.Length} error={error}");
+                return false;
             }
             finally
             {
-                SilkMarshal.Free((nint)entryPoint);
-                _vk.DestroyShaderModule(_device, computeModule, null);
+                if (entryPoint != null)
+                {
+                    SilkMarshal.Free((nint)entryPoint);
+                }
+
+                if (computeModule.Handle != 0)
+                {
+                    _vk.DestroyShaderModule(_device, computeModule, null);
+                }
             }
         }
 
@@ -9046,6 +9087,19 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // Astro cs=0x500A44A00 (1x1 type=8 ImageLoad/Store) repeatedly AVs
+            // inside the native vkCreateComputePipelines path; that fault is
+            // not recoverable via managed catch and kills the VideoOut thread.
+            if (work.ShaderAddress == 0x0000_0005_00A4_4A00UL)
+            {
+                LogRejectedComputeDispatch(work, "astro-compute-pipeline-av");
+                TraceVulkanShader(
+                    $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
+                    $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                    $"reason=astro-compute-pipeline-av");
+                return;
+            }
+
             TranslatedDrawResources? resources = null;
             CommandBuffer commandBuffer = default;
             var submitted = false;
@@ -9053,7 +9107,21 @@ internal static unsafe class VulkanVideoPresenter
             try
             {
                 EnsureGuestSubmissionCapacity();
-                resources = CreateComputeDispatchResources(work);
+                try
+                {
+                    resources = CreateComputeDispatchResources(work);
+                }
+                catch (Exception exception)
+                {
+                    LogRejectedComputeDispatch(
+                        work,
+                        "pipeline-create:" + exception.GetType().Name);
+                    TraceVulkanShader(
+                        $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
+                        $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                        $"reason=pipeline-create-failed");
+                    return;
+                }
 
                 var batchCount = Math.Max(
                     1u,

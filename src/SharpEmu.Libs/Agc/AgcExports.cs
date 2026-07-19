@@ -5026,7 +5026,11 @@ public static partial class AgcExports
             for (var index = _labelProducers.Count - 1; index >= 0; index--)
             {
                 var producer = _labelProducers[index];
-                if (!ReferenceEquals(producer.Memory, memory) || producer.Length == 0)
+                // Completed producers no longer keep orphan waits alive; only
+                // in-flight / cb-build placeholders block force-satisfy.
+                if (!ReferenceEquals(producer.Memory, memory) ||
+                    producer.Length == 0 ||
+                    producer.Completed)
                 {
                     continue;
                 }
