@@ -141,6 +141,7 @@ public static partial class AgcExports
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType3D = 10;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -8211,12 +8212,18 @@ public static partial class AgcExports
         out GuestDrawTexture texture)
     {
         texture = default!;
+        var textureDepth = descriptor.Type == Gen5TextureType3D
+            ? Math.Max(descriptor.Depth, 1u)
+            : 1u;
         if ((descriptor.Type != Gen5TextureType1D &&
-             descriptor.Type != Gen5TextureType2D) ||
+             descriptor.Type != Gen5TextureType2D &&
+             descriptor.Type != Gen5TextureType3D) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
+            textureDepth == 0 ||
             descriptor.Width > 8192 ||
-            descriptor.Height > 8192)
+            descriptor.Height > 8192 ||
+            textureDepth > 2048)
         {
             TraceTextureFallback(descriptor, "invalid-descriptor");
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
@@ -8232,7 +8239,8 @@ public static partial class AgcExports
         var sourceByteCount = GetTextureByteCount(
             descriptor.Format,
             sourceWidth,
-            descriptor.Height);
+            descriptor.Height,
+            textureDepth);
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
@@ -8292,7 +8300,8 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToGuestSampler(samplerDescriptor));
+                Sampler: ToGuestSampler(samplerDescriptor),
+                Depth: textureDepth);
             return true;
         }
 
@@ -8365,7 +8374,8 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToGuestSampler(samplerDescriptor));
+                Sampler: ToGuestSampler(samplerDescriptor),
+                Depth: textureDepth);
             return true;
         }
 
@@ -8391,7 +8401,8 @@ public static partial class AgcExports
                     descriptor.DstSelect,
                     descriptor.TileMode,
                     sourceWidth,
-                    sampler)))
+                    sampler,
+                    textureDepth)))
         {
             texture = new GuestDrawTexture(
                 descriptor.Address,
@@ -8409,7 +8420,8 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: sampler);
+                Sampler: sampler,
+                Depth: textureDepth);
             return true;
         }
 
@@ -8469,7 +8481,8 @@ public static partial class AgcExports
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
-            Sampler: ToGuestSampler(samplerDescriptor));
+            Sampler: sampler,
+            Depth: textureDepth);
         return true;
     }
 
@@ -9137,7 +9150,8 @@ public static partial class AgcExports
                 TraceAgcShader(
                     $"agc.compute_writer addr=0x{texture.Address:X16} " +
                     $"fmt={texture.Format} num={texture.NumberType} tile={texture.TileMode} " +
-                    $"size={texture.Width}x{texture.Height} " +
+                    $"size={texture.Width}x{texture.Height}x{Math.Max(texture.Depth, 1u)} " +
+                    $"type={texture.Type} " +
                     $"cs=0x{shaderAddress:X16} op={binding.Opcode}");
             }
         }
@@ -10013,18 +10027,25 @@ public static partial class AgcExports
             _ => 0UL,
         };
 
-    private static ulong GetTextureByteCount(uint format, uint width, uint height)
+    private static ulong GetTextureByteCount(uint format, uint width, uint height, uint depth = 1)
     {
         var bytesPerTexel = GetTextureBytesPerTexel(format);
+        ulong planeBytes;
         if (bytesPerTexel != 0)
         {
-            return checked((ulong)width * height * bytesPerTexel);
+            planeBytes = checked((ulong)width * height * bytesPerTexel);
+        }
+        else
+        {
+            var blockBytes = (ulong)GetBlockCompressedBlockBytes(format);
+            planeBytes = blockBytes == 0
+                ? 0
+                : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
         }
 
-        var blockBytes = (ulong)GetBlockCompressedBlockBytes(format);
-        return blockBytes == 0
+        return planeBytes == 0
             ? 0
-            : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
+            : checked(planeBytes * Math.Max(depth, 1u));
     }
 
     private static uint GetLinearTexturePitch(uint pitch, uint height, uint format)

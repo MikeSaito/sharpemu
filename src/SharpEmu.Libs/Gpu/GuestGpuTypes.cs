@@ -27,7 +27,8 @@ internal sealed record GuestDrawTexture(
     uint Pitch = 0,
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
-    GuestSampler Sampler = default);
+    GuestSampler Sampler = default,
+    uint Depth = 1);
 
 /// <summary>Raw guest sampler descriptor dwords, copied verbatim from guest memory.</summary>
 internal readonly record struct GuestSampler(
@@ -147,7 +148,8 @@ internal sealed record GuestRenderTarget(
     uint Height,
     uint Format,
     uint NumberType,
-    uint MipLevels = 1);
+    uint MipLevels = 1,
+    uint Depth = 1);
 
 /// <summary>Guest DB surface bound alongside a color render target.</summary>
 internal sealed record GuestDepthTarget(
