@@ -79,10 +79,18 @@ public static class PadExports
     private static readonly int InjectGapMs = ReadPositiveEnvMs("SHARPEMU_PAD_INJECT_GAP_MS", 2_000);
     private static readonly int InjectPulses = Math.Clamp(ReadNonNegativeEnvInt("SHARPEMU_PAD_INJECT_PULSES", 3), 0, 32);
     private static readonly int InjectOptionsPulses = Math.Clamp(ReadNonNegativeEnvInt("SHARPEMU_PAD_INJECT_OPTIONS_PULSES", 3), 0, 32);
+    // D-pad Down before Cross: Astro title often highlights Continue when a
+    // SaveData memory slot already exists; Down moves to New Game.
+    private static readonly int InjectDownPulses = Math.Clamp(ReadNonNegativeEnvInt("SHARPEMU_PAD_INJECT_DOWN_PULSES", 0), 0, 32);
     private static long _injectEpochTicks;
     private static int _injectDelayMs = InjectAfterMs;
     private static int _titleInjectArmed;
     private static int _optionsDeliveredLogged;
+    private static int _downDeliveredLogged;
+    // PadRead often starts after the Cross pulse window; gate Options (and
+    // schedule expiry) on an actual Cross sample with inject bit set.
+    private static int _titleCrossInjectSeen;
+    private static long _titleCrossSeenTicks;
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -161,7 +169,7 @@ public static class PadExports
                 Console.Error.WriteLine(
                     $"[LOADER][INFO] pad.inject_cross=1 after_ms={InjectAfterMs} title_delay_ms={InjectTitleDelayMs} " +
                     $"hold_ms={InjectHoldMs} options_hold_ms={InjectOptionsHoldMs} gap_ms={InjectGapMs} " +
-                    $"pulses={InjectPulses} options_pulses={InjectOptionsPulses}");
+                    $"down_pulses={InjectDownPulses} pulses={InjectPulses} options_pulses={InjectOptionsPulses}");
             }
         }
 
@@ -728,11 +736,15 @@ public static class PadExports
         _injectDelayMs = InjectTitleDelayMs;
         Interlocked.Exchange(ref _crossDeliveredLogged, 0);
         Interlocked.Exchange(ref _optionsDeliveredLogged, 0);
+        Interlocked.Exchange(ref _downDeliveredLogged, 0);
+        Interlocked.Exchange(ref _titleCrossInjectSeen, 0);
+        Interlocked.Exchange(ref _titleCrossSeenTicks, 0);
         if (Interlocked.Exchange(ref _titleInjectArmed, 1) == 0)
         {
             Console.Error.WriteLine(
                 $"[LOADER][INFO] pad.inject_cross armed after title delay_ms={InjectTitleDelayMs} " +
-                $"pulses={InjectPulses} options_pulses={InjectOptionsPulses} options_hold_ms={InjectOptionsHoldMs}");
+                $"down_pulses={InjectDownPulses} pulses={InjectPulses} options_pulses={InjectOptionsPulses} " +
+                $"options_hold_ms={InjectOptionsHoldMs}");
         }
     }
 
@@ -765,34 +777,61 @@ public static class PadExports
             return 0;
         }
 
-        // Title: PadRead often starts late and misses short Cross pulses.
-        // Alternate long Cross / Options holds so the first sample still hits Cross.
+        // Title: hold Cross (after optional Down) until PadRead actually samples
+        // an injected Cross, then run Options holds. Late PadRead otherwise
+        // lands only on Options and never confirms New Game / start.
         var titleCycle = InjectOptionsHoldMs + InjectGapMs;
         if (titleCycle <= 0)
         {
             return 0;
         }
 
-        var totalPulses = InjectPulses + InjectOptionsPulses;
-        if (totalPulses <= 0)
+        var crossSeen = Volatile.Read(ref _titleCrossInjectSeen) != 0;
+        if (!crossSeen)
+        {
+            var prepCycle = titleCycle;
+            var prepPulse = (int)(sinceFirst / prepCycle);
+            var prepOffset = (int)(sinceFirst % prepCycle);
+            if (prepOffset >= InjectOptionsHoldMs)
+            {
+                return 0;
+            }
+
+            if (InjectDownPulses > 0 && prepPulse < InjectDownPulses)
+            {
+                return OrbisPadButton.Down;
+            }
+
+            return OrbisPadButton.Cross;
+        }
+
+        if (InjectOptionsPulses <= 0)
         {
             return 0;
         }
 
-        var pulse = (int)(sinceFirst / titleCycle);
-        if (pulse < 0 || pulse >= totalPulses)
+        var crossSeenTicks = Volatile.Read(ref _titleCrossSeenTicks);
+        if (crossSeenTicks == 0)
         {
             return 0;
         }
 
-        var offset = (int)(sinceFirst % titleCycle);
-        if (offset >= InjectOptionsHoldMs)
+        var sinceCrossMs = (nowTicks - crossSeenTicks) * 1000L / Stopwatch.Frequency;
+        // One gap so Cross releases before Options.
+        if (sinceCrossMs < InjectGapMs)
         {
             return 0;
         }
 
-        // Cross first (InjectPulses), then Options (InjectOptionsPulses).
-        return pulse < InjectPulses ? OrbisPadButton.Cross : OrbisPadButton.Options;
+        var optionsElapsed = sinceCrossMs - InjectGapMs;
+        var optionsPulse = (int)(optionsElapsed / titleCycle);
+        if (optionsPulse < 0 || optionsPulse >= InjectOptionsPulses)
+        {
+            return 0;
+        }
+
+        var optionsOffset = (int)(optionsElapsed % titleCycle);
+        return optionsOffset < InjectOptionsHoldMs ? OrbisPadButton.Options : 0;
     }
 
     private static void TracePadWrite(string api, HostInputSample sample)
@@ -801,12 +840,29 @@ public static class PadExports
         var buttons = sample.State.Buttons;
         var cross = (buttons & OrbisPadButton.Cross) != 0;
         var options = (buttons & OrbisPadButton.Options) != 0;
+        var down = (buttons & OrbisPadButton.Down) != 0;
+        if (down && Interlocked.Exchange(ref _downDeliveredLogged, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] pad.down_delivered api={api} buttons=0x{buttons:X} " +
+                $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
+                $"inject=0x{sample.Injected:X}");
+        }
+
         if (cross && Interlocked.Exchange(ref _crossDeliveredLogged, 1) == 0)
         {
             Console.Error.WriteLine(
                 $"[LOADER][INFO] pad.cross_delivered api={api} buttons=0x{buttons:X} " +
                 $"focused={(sample.Focused ? 1 : 0)} kb={(sample.KeyboardArmed ? 1 : 0)} " +
                 $"inject=0x{sample.Injected:X}");
+        }
+
+        if (cross && (sample.Injected & OrbisPadButton.Cross) != 0)
+        {
+            if (Interlocked.Exchange(ref _titleCrossInjectSeen, 1) == 0)
+            {
+                Interlocked.Exchange(ref _titleCrossSeenTicks, Stopwatch.GetTimestamp());
+            }
         }
 
         if (options && Interlocked.Exchange(ref _optionsDeliveredLogged, 1) == 0)

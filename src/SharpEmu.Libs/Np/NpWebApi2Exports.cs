@@ -11,6 +11,7 @@ public static class NpWebApi2Exports
 
     private static int _initialized;
     private static int _nextUserContext;
+    private static int _nextLibContext;
     // Soft CreateUserContext before first present stalls RoomLoad; waiting until
     // title is too late (Astro retries ~100x between first frame and title).
     private static int _userContextAllowed;
@@ -37,8 +38,16 @@ public static class NpWebApi2Exports
         }
 
         Interlocked.Exchange(ref _initialized, 1);
+        var libContextId = Interlocked.Increment(ref _nextLibContext);
+        if (libContextId <= 0)
+        {
+            Interlocked.Exchange(ref _nextLibContext, 1);
+            libContextId = 1;
+        }
+
         TraceNpWebApi2("init", httpContextId, poolSize);
-        return ctx.SetReturn(0);
+        // SDK returns the library context id on success (not a bare 0 status).
+        return ctx.SetReturn(libContextId);
     }
 
     [SysAbiExport(
