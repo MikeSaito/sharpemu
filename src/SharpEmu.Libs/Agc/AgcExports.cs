@@ -202,6 +202,7 @@ public static partial class AgcExports
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly HashSet<ulong> _tracedEmptySrtDrawRejects = new();
+    private static readonly HashSet<(ulong Es, ulong Ps)> _tracedFixedFullscreenClears = new();
     private static readonly HashSet<(ulong Address, uint X, uint Y, uint Z)>
         _tracedDispatchArguments = new();
     private static readonly HashSet<(ulong Address, uint Initiator, string Reason)>
@@ -440,7 +441,12 @@ public static partial class AgcExports
         uint RawBlendControl,
         uint RawColorInfo,
         IReadOnlyList<uint> PixelInitialScalars,
-        IReadOnlyList<uint> VertexInitialScalars);
+        IReadOnlyList<uint> VertexInitialScalars,
+        bool IsFullscreenColorClear = false,
+        float ClearRed = 0f,
+        float ClearGreen = 0f,
+        float ClearBlue = 0f,
+        float ClearAlpha = 1f);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -5767,21 +5773,34 @@ public static partial class AgcExports
                     }
                 }
 
-                GuestGpu.Current.SubmitOffscreenTranslatedDraw(
-                    translatedDraw.PixelShader,
-                    sharedTextures,
-                    sharedGlobalMemoryBuffers,
-                    translatedDraw.AttributeCount,
-                    translatedDraw.GuestTargets,
-                    translatedDraw.VertexShader,
-                    translatedDraw.VertexCount,
-                    translatedDraw.InstanceCount,
-                    translatedDraw.PrimitiveType,
-                    translatedDraw.IndexBuffer,
-                    sharedVertexBuffers,
-                    translatedDraw.RenderState,
-                    translatedDraw.DepthTarget,
-                    translatedDraw.PixelShaderAddress);
+                if (translatedDraw.IsFullscreenColorClear)
+                {
+                    VulkanVideoPresenter.SubmitOffscreenColorClear(
+                        translatedDraw.GuestTargets,
+                        translatedDraw.ClearRed,
+                        translatedDraw.ClearGreen,
+                        translatedDraw.ClearBlue,
+                        translatedDraw.ClearAlpha,
+                        translatedDraw.PixelShaderAddress);
+                }
+                else
+                {
+                    GuestGpu.Current.SubmitOffscreenTranslatedDraw(
+                        translatedDraw.PixelShader,
+                        sharedTextures,
+                        sharedGlobalMemoryBuffers,
+                        translatedDraw.AttributeCount,
+                        translatedDraw.GuestTargets,
+                        translatedDraw.VertexShader,
+                        translatedDraw.VertexCount,
+                        translatedDraw.InstanceCount,
+                        translatedDraw.PrimitiveType,
+                        translatedDraw.IndexBuffer,
+                        sharedVertexBuffers,
+                        translatedDraw.RenderState,
+                        translatedDraw.DepthTarget,
+                        translatedDraw.PixelShaderAddress);
+                }
             }
             else
             {
@@ -6217,10 +6236,11 @@ public static partial class AgcExports
             return false;
         }
 
-        // Empty SRT/EUD with no guest-backed images/globals collapses into
-        // Address-0 fallback descriptors. Submitting that offscreen batch
-        // (ps=0x808E88000 → 2432x1368) loses the Vulkan device after Astro
-        // Bot's first presented frame. Prefer skip over QueueSubmit.
+        // Empty SRT/EUD is fine for clears/passthroughs that bind nothing
+        // (Astro title PS 0x808E88000 is a procedural fullscreen clear).
+        // Reject only when evaluation produced image/global slots that
+        // collapsed to Address-0 — that layout mismatches SPIR-V and loses
+        // the device on QueueSubmit.
         if (pixelState.Metadata is
             {
                 ShaderResourceTableSizeDwords: 0,
@@ -6229,6 +6249,7 @@ public static partial class AgcExports
             Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(
                 pixelShaderAddress))
         {
+            var hasAnyImageSlot = pixelEvaluation.ImageBindings.Count > 0;
             var hasUsablePixelImage = false;
             foreach (var binding in pixelEvaluation.ImageBindings)
             {
@@ -6242,7 +6263,8 @@ public static partial class AgcExports
 
             var hasUsablePixelGlobal = pixelEvaluation.GlobalMemoryBindings.Any(
                 static binding => binding.BaseAddress != 0);
-            if (!hasUsablePixelImage && !hasUsablePixelGlobal)
+            var hasPoisonImageSlots = hasAnyImageSlot && !hasUsablePixelImage;
+            if (hasPoisonImageSlots && !hasUsablePixelGlobal)
             {
                 error = Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(
                     pixelShaderAddress)
@@ -6255,6 +6277,39 @@ public static partial class AgcExports
                         Console.Error.WriteLine(
                             $"[LOADER][WARN] agc.draw_reject ps=0x{pixelShaderAddress:X16} " +
                             $"es=0x{exportShaderAddress:X16} reason={error}");
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] agc.draw_reject_state ps=0x{pixelShaderAddress:X16} " +
+                            $"header=0x{pixelShaderHeader:X16} " +
+                            Gen5ShaderTranslator.DescribeState(pixelState));
+                        var shDump = new List<string>(16);
+                        for (uint reg = 0x8; reg <= 0x1C; reg++)
+                        {
+                            if (state.ShRegisters.TryGetValue(reg, out var value))
+                            {
+                                shDump.Add($"0x{reg:X}={value:X8}");
+                            }
+                        }
+
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] agc.draw_reject_sh ps=0x{pixelShaderAddress:X16} " +
+                            $"[{string.Join(',', shDump)}]");
+                        var bindingIndex = 0;
+                        foreach (var binding in pixelEvaluation.ImageBindings)
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] agc.draw_reject_binding ps=0x{pixelShaderAddress:X16} " +
+                                $"[{bindingIndex++}] pc=0x{binding.Pc:X} op={binding.Opcode} " +
+                                $"resource={FormatShaderDwords(binding.ResourceDescriptor)} " +
+                                $"sampler={FormatShaderDwords(binding.SamplerDescriptor)}");
+                        }
+
+                        foreach (var binding in pixelEvaluation.GlobalMemoryBindings)
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] agc.draw_reject_global ps=0x{pixelShaderAddress:X16} " +
+                                $"s{binding.ScalarAddress} base=0x{binding.BaseAddress:X16} " +
+                                $"bytes={binding.DataLength}");
+                        }
                     }
                 }
 
@@ -6369,102 +6424,165 @@ public static partial class AgcExports
             ? guestGlobalBuffers
             : guestGlobalBuffers + 2;
         _graphicsShaderCache.TryGetValue(shaderKey, out var compiled);
+        var usedFixedFullscreenClear = false;
+        (float Red, float Green, float Blue, float Alpha) fullscreenClearColor = default;
 
         if (compiled.Vertex is null || compiled.Pixel is null)
         {
-            var pixelOutputs = new Gen5PixelOutputBinding[renderTargets.Length];
-            for (var location = 0; location < renderTargets.Length; location++)
-            {
-                pixelOutputs[location] = new Gen5PixelOutputBinding(
-                    renderTargets[location].Slot,
-                    (uint)location,
-                    renderTargetOutputKinds[location]);
-            }
-
-            if (!GuestGpu.Current.TryCompilePixelShader(
-                    pixelState,
-                    pixelEvaluation,
-                    pixelOutputs,
-                    out var pixelShader,
-                    out error,
-                    globalBufferBase: 0,
-                    totalGlobalBufferCount: totalGlobalBuffers,
-                    imageBindingBase: 0,
-                    scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
-                    pixelInputEnable: psInputEna,
-                    pixelInputAddress: psInputAddr,
-                    storageBufferOffsetAlignment:
-                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment) ||
-                !GuestGpu.Current.TryCompileVertexShader(
+            if (IsProceduralFullscreenClearPair(
                     exportState,
                     exportEvaluation,
-                    out var vertexShader,
-                    out error,
-                    globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
-                    totalGlobalBufferCount: totalGlobalBuffers,
-                    imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1,
-                    requiredVertexOutputCount: (int)GetInterpolatedAttributeCount(pixelState),
-                    storageBufferOffsetAlignment:
-                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment))
+                    pixelState,
+                    pixelEvaluation))
+            {
+                // Title ES/PS clear (0x808E88D00/0x808E88000): empty SRT/EUD.
+                // Gen5→SPIR-V and even fixed fragment pipelines have lost the
+                // device on the 2432x1368 offscreen submit. Apply the solid
+                // clear via CmdClearColorImage so the pass still runs without
+                // Address-0 descriptors or a graphics pipeline.
+                usedFixedFullscreenClear = true;
+                fullscreenClearColor = DecodeSolidClearColor(pixelEvaluation);
+                lock (_submitTraceGate)
+                {
+                    if (_tracedFixedFullscreenClears.Add(
+                            (exportShaderAddress, pixelShaderAddress)))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] agc.shader_color_clear " +
+                            $"es=0x{exportShaderAddress:X16} " +
+                            $"ps=0x{pixelShaderAddress:X16} " +
+                            $"rgba=({fullscreenClearColor.Red:0.###}," +
+                            $"{fullscreenClearColor.Green:0.###}," +
+                            $"{fullscreenClearColor.Blue:0.###}," +
+                            $"{fullscreenClearColor.Alpha:0.###})");
+                    }
+                }
+
+                compiled = (
+                    GuestGpu.Current.GetDepthOnlyFragmentShader(),
+                    GuestGpu.Current.GetDepthOnlyFragmentShader());
+                _graphicsShaderCache.TryAdd(shaderKey, compiled);
+            }
+            else
+            {
+                var pixelOutputs = new Gen5PixelOutputBinding[renderTargets.Length];
+                for (var location = 0; location < renderTargets.Length; location++)
+                {
+                    pixelOutputs[location] = new Gen5PixelOutputBinding(
+                        renderTargets[location].Slot,
+                        (uint)location,
+                        renderTargetOutputKinds[location]);
+                }
+
+                if (!GuestGpu.Current.TryCompilePixelShader(
+                        pixelState,
+                        pixelEvaluation,
+                        pixelOutputs,
+                        out var pixelShader,
+                        out error,
+                        globalBufferBase: 0,
+                        totalGlobalBufferCount: totalGlobalBuffers,
+                        imageBindingBase: 0,
+                        scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
+                        pixelInputEnable: psInputEna,
+                        pixelInputAddress: psInputAddr,
+                        storageBufferOffsetAlignment:
+                            VulkanVideoPresenter.GuestStorageBufferOffsetAlignment) ||
+                    !GuestGpu.Current.TryCompileVertexShader(
+                        exportState,
+                        exportEvaluation,
+                        out var vertexShader,
+                        out error,
+                        globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
+                        totalGlobalBufferCount: totalGlobalBuffers,
+                        imageBindingBase: pixelEvaluation.ImageBindings.Count,
+                        scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1,
+                        requiredVertexOutputCount: (int)GetInterpolatedAttributeCount(pixelState),
+                        storageBufferOffsetAlignment:
+                            VulkanVideoPresenter.GuestStorageBufferOffsetAlignment))
+                {
+                    ReturnPooledEvaluationArrays(exportEvaluation);
+                    ReturnPooledEvaluationArrays(pixelEvaluation);
+                    return false;
+                }
+
+                compiled = (vertexShader!, pixelShader!);
+                DumpCompiledShader(
+                    "vs",
+                    exportShaderAddress,
+                    exportStateFingerprint,
+                    compiled.Vertex,
+                    exportState.Program);
+                DumpCompiledShader(
+                    "ps",
+                    pixelShaderAddress,
+                    pixelStateFingerprint,
+                    compiled.Pixel,
+                    pixelState.Program);
+                VulkanVideoPresenter.CountSpirvCompilation();
+                _graphicsShaderCache.TryAdd(shaderKey, compiled);
+            }
+        }
+        else if (IsCachedFixedFullscreenClearPair(
+                     exportState,
+                     exportEvaluation,
+                     pixelState,
+                     pixelEvaluation))
+        {
+            usedFixedFullscreenClear = true;
+            fullscreenClearColor = DecodeSolidClearColor(pixelEvaluation);
+        }
+
+        var useFixedFullscreenClear = usedFixedFullscreenClear;
+
+        List<TranslatedImageBinding> textures;
+        Gen5GlobalMemoryBinding[] globalMemoryBindings;
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs;
+        if (useFixedFullscreenClear)
+        {
+            textures = [];
+            globalMemoryBindings = [];
+            vertexInputs = [];
+        }
+        else
+        {
+            textures = new List<TranslatedImageBinding>(
+                pixelEvaluation.ImageBindings.Count +
+                exportEvaluation.ImageBindings.Count);
+            if (!TryAppendTranslatedImageBindings(
+                    pixelEvaluation.ImageBindings,
+                    textures,
+                    pixelShaderAddress,
+                    exportShaderAddress,
+                    out error) ||
+                !TryAppendTranslatedImageBindings(
+                    exportEvaluation.ImageBindings,
+                    textures,
+                    pixelShaderAddress,
+                    exportShaderAddress,
+                    out error))
             {
                 ReturnPooledEvaluationArrays(exportEvaluation);
                 ReturnPooledEvaluationArrays(pixelEvaluation);
                 return false;
             }
 
-            compiled = (vertexShader!, pixelShader!);
-            DumpCompiledShader(
-                "vs",
-                exportShaderAddress,
-                exportStateFingerprint,
-                compiled.Vertex,
-                exportState.Program);
-            DumpCompiledShader(
-                "ps",
-                pixelShaderAddress,
-                pixelStateFingerprint,
-                compiled.Pixel,
-                pixelState.Program);
-            VulkanVideoPresenter.CountSpirvCompilation();
-            _graphicsShaderCache.TryAdd(shaderKey, compiled);
+            globalMemoryBindings = new Gen5GlobalMemoryBinding[
+                pixelEvaluation.GlobalMemoryBindings.Count +
+                exportEvaluation.GlobalMemoryBindings.Count];
+            for (var index = 0; index < pixelEvaluation.GlobalMemoryBindings.Count; index++)
+            {
+                globalMemoryBindings[index] = pixelEvaluation.GlobalMemoryBindings[index];
+            }
+            for (var index = 0; index < exportEvaluation.GlobalMemoryBindings.Count; index++)
+            {
+                globalMemoryBindings[pixelEvaluation.GlobalMemoryBindings.Count + index] =
+                    exportEvaluation.GlobalMemoryBindings[index];
+            }
+
+            vertexInputs = exportEvaluation.VertexInputs ?? [];
         }
 
-        var textures = new List<TranslatedImageBinding>(
-            pixelEvaluation.ImageBindings.Count +
-            exportEvaluation.ImageBindings.Count);
-        if (!TryAppendTranslatedImageBindings(
-                pixelEvaluation.ImageBindings,
-                textures,
-                pixelShaderAddress,
-                exportShaderAddress,
-                out error) ||
-            !TryAppendTranslatedImageBindings(
-                exportEvaluation.ImageBindings,
-                textures,
-                pixelShaderAddress,
-                exportShaderAddress,
-                out error))
-        {
-            ReturnPooledEvaluationArrays(exportEvaluation);
-            ReturnPooledEvaluationArrays(pixelEvaluation);
-            return false;
-        }
-
-        var globalMemoryBindings = new Gen5GlobalMemoryBinding[
-            pixelEvaluation.GlobalMemoryBindings.Count +
-            exportEvaluation.GlobalMemoryBindings.Count];
-        for (var index = 0; index < pixelEvaluation.GlobalMemoryBindings.Count; index++)
-        {
-            globalMemoryBindings[index] = pixelEvaluation.GlobalMemoryBindings[index];
-        }
-        for (var index = 0; index < exportEvaluation.GlobalMemoryBindings.Count; index++)
-        {
-            globalMemoryBindings[pixelEvaluation.GlobalMemoryBindings.Count + index] =
-                exportEvaluation.GlobalMemoryBindings[index];
-        }
-        IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
-            exportEvaluation.VertexInputs ?? [];
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var guestTargets = new GuestRenderTarget[renderTargets.Length];
         for (var index = 0; index < renderTargets.Length; index++)
@@ -6513,7 +6631,12 @@ public static partial class AgcExports
                 ? rawInfo
                 : 0,
             pixelEvaluation.InitialScalarRegisters,
-            exportEvaluation.InitialScalarRegisters);
+            exportEvaluation.InitialScalarRegisters,
+            useFixedFullscreenClear,
+            fullscreenClearColor.Red,
+            fullscreenClearColor.Green,
+            fullscreenClearColor.Blue,
+            fullscreenClearColor.Alpha);
         return true;
     }
 
@@ -6624,6 +6747,119 @@ public static partial class AgcExports
                     Convert.ToHexString(binding.Data.AsSpan(offset, 16)));
             }
         }
+    }
+
+    private static bool IsCachedFixedFullscreenClearPair(
+        Gen5ShaderState exportState,
+        Gen5ShaderEvaluation exportEvaluation,
+        Gen5ShaderState pixelState,
+        Gen5ShaderEvaluation pixelEvaluation) =>
+        IsProceduralFullscreenClearPair(
+            exportState,
+            exportEvaluation,
+            pixelState,
+            pixelEvaluation);
+
+    private static bool IsProceduralFullscreenClearPair(
+        Gen5ShaderState exportState,
+        Gen5ShaderEvaluation exportEvaluation,
+        Gen5ShaderState pixelState,
+        Gen5ShaderEvaluation pixelEvaluation)
+    {
+        if ((exportEvaluation.VertexInputs?.Count ?? 0) != 0 ||
+            exportEvaluation.ImageBindings.Count != 0 ||
+            pixelEvaluation.ImageBindings.Count != 0 ||
+            exportEvaluation.GlobalMemoryBindings.Count != 0 ||
+            pixelEvaluation.GlobalMemoryBindings.Count != 0)
+        {
+            return false;
+        }
+
+        if (!HasExportTarget(exportState, target: 12) ||
+            !HasExportTarget(pixelState, target: 0))
+        {
+            return false;
+        }
+
+        if (pixelState.Program.Instructions.Count is 0 or > 8 ||
+            exportState.Program.Instructions.Count is 0 or > 48)
+        {
+            return false;
+        }
+
+        return pixelState.Program.Instructions.All(IsBenignClearPixelInstruction) &&
+               exportState.Program.Instructions.All(IsBenignProceduralVertexInstruction);
+    }
+
+    private static bool HasExportTarget(Gen5ShaderState state, uint target) =>
+        state.Program.Instructions.Any(instruction =>
+            instruction.Control is Gen5ExportControl export &&
+            export.Target == target);
+
+    private static bool IsBenignClearPixelInstruction(Gen5ShaderInstruction instruction) =>
+        instruction.Opcode is
+            "SNop" or
+            "SWaitcnt" or
+            "SInstPrefetch" or
+            "SEndpgm" or
+            "VMovB32" ||
+        instruction.Control is Gen5ExportControl { Target: 0 };
+
+    private static bool IsBenignProceduralVertexInstruction(Gen5ShaderInstruction instruction)
+    {
+        if (instruction.Control is Gen5BufferMemoryControl or
+            Gen5ImageControl or
+            Gen5GlobalMemoryControl or
+            Gen5ScalarMemoryControl)
+        {
+            return false;
+        }
+
+        if (instruction.Control is Gen5ExportControl export)
+        {
+            // Position (12) plus ignored NGG/param exports.
+            return export.Target is 12 or (>= 13 and < 32) or 20;
+        }
+
+        return instruction.Opcode is
+            "SNop" or
+            "SWaitcnt" or
+            "SInstPrefetch" or
+            "SEndpgm" or
+            "SSendmsg" or
+            "VMovB32" or
+            "VAndB32" or
+            "VAddI32" or
+            "VLshlrevB32" or
+            "VCvtF32I32" or
+            "VCvtF32U32" ||
+            instruction.Encoding is
+                Gen5ShaderEncoding.Sop1 or
+                Gen5ShaderEncoding.Sop2 or
+                Gen5ShaderEncoding.Sopc or
+                Gen5ShaderEncoding.Sopk or
+                Gen5ShaderEncoding.Sopp;
+    }
+
+    private static (float Red, float Green, float Blue, float Alpha) DecodeSolidClearColor(
+        Gen5ShaderEvaluation pixelEvaluation)
+    {
+        // Default opaque white; guest clear shaders often mov a 1.0 literal into v0.
+        float red = 1f, green = 1f, blue = 1f, alpha = 1f;
+        if (pixelEvaluation.InitialScalarRegisters.Count > 0)
+        {
+            var bits = pixelEvaluation.InitialScalarRegisters[0];
+            if (bits != 0)
+            {
+                red = green = blue = alpha = BitConverter.UInt32BitsToSingle(bits);
+                if (!float.IsFinite(red) || red < 0f || red > 4f)
+                {
+                    red = green = blue = alpha = 1f;
+                }
+            }
+        }
+
+        return (red, green, blue, alpha);
     }
 
     private static readonly bool _fillClearHack = !string.Equals(
@@ -11160,7 +11396,22 @@ public static partial class AgcExports
         layoutBytes = (FusedShaderHeaderBytes * 2UL) + codeBytesA + codeBytesB;
 
         // Retarget only intra-header pointers into scratch mirrors (safe; does not mutate half blobs).
-        _ = TryRetargetPointerField(ctx, destinationAddress + ShaderUserDataOffset, scratchHeaderA, shaderAAddress);
+        // Userdata follows the pixel half when one side is PS so SRT/EUD stay with the PS.
+        var userDataScratch = typeA == 1
+            ? scratchHeaderA
+            : typeB == 1
+                ? scratchHeaderB
+                : scratchHeaderA;
+        var userDataOriginal = typeA == 1
+            ? shaderAAddress
+            : typeB == 1
+                ? shaderBAddress
+                : shaderAAddress;
+        _ = TryRetargetPointerField(
+            ctx,
+            destinationAddress + ShaderUserDataOffset,
+            userDataScratch,
+            userDataOriginal);
         _ = TryRetargetPointerField(ctx, destinationAddress + ShaderCxRegistersOffset, scratchHeaderA, shaderAAddress);
         _ = TryRetargetPointerField(ctx, destinationAddress + ShaderShRegistersOffset, scratchHeaderA, shaderAAddress);
         _ = TryRetargetPointerField(ctx, destinationAddress + ShaderSpecialsOffset, scratchHeaderA, shaderAAddress);
@@ -11241,12 +11492,24 @@ public static partial class AgcExports
             }
         }
 
-        // If dest userData was cleared by a prior failed fuse path, adopt B's when present.
-        if (ctx.TryReadUInt64(destinationAddress + ShaderUserDataOffset, out var userData) &&
+        // Pixel half owns SRT/EUD userdata used when translating the PS.
+        // Dest starts as a copy of A; without this, an ES+PS fuse keeps the ES
+        // userdata tables and the PS translates with srt=0 / empty resources.
+        var preferBUserData = typeB == 1 && typeA != 1;
+        if (preferBUserData)
+        {
+            if (ctx.TryReadUInt64(halfBAddress + ShaderUserDataOffset, out var userDataB) &&
+                userDataB != 0)
+            {
+                _ = ctx.TryWriteUInt64(destinationAddress + ShaderUserDataOffset, userDataB);
+            }
+        }
+        else if (ctx.TryReadUInt64(destinationAddress + ShaderUserDataOffset, out var userData) &&
             userData == 0 &&
             ctx.TryReadUInt64(halfBAddress + ShaderUserDataOffset, out var userDataB) &&
             userDataB != 0)
         {
+            // Dest userData cleared by a prior failed fuse path — adopt B.
             _ = ctx.TryWriteUInt64(destinationAddress + ShaderUserDataOffset, userDataB);
         }
     }

@@ -54,6 +54,14 @@ internal sealed record VulkanOffscreenGuestDraw(
     bool PublishTarget,
     ulong ShaderAddress);
 
+internal sealed record VulkanOffscreenColorClear(
+    IReadOnlyList<GuestRenderTarget> Targets,
+    float Red,
+    float Green,
+    float Blue,
+    float Alpha,
+    ulong ShaderAddress);
+
 internal sealed record VulkanComputeGuestDispatch(
     ulong ShaderAddress,
     byte[] ComputeSpirv,
@@ -839,6 +847,67 @@ internal static unsafe class VulkanVideoPresenter
 
             _guestImageWorkSequences[address] = EnqueueGuestWorkLocked(
                 new VulkanGuestImageWrite(address, null, fillValue));
+        }
+    }
+
+    /// <summary>
+    /// Apply a solid color clear to offscreen guest render targets without a
+    /// graphics pipeline. Used for empty-SRT procedural clear draws that
+    /// otherwise lose the device on QueueSubmit with Address-0 descriptors.
+    /// </summary>
+    internal static void SubmitOffscreenColorClear(
+        IReadOnlyList<GuestRenderTarget> targets,
+        float red,
+        float green,
+        float blue,
+        float alpha,
+        ulong shaderAddress = 0)
+    {
+        if (targets.Count == 0 ||
+            targets.Count > 8 ||
+            AnyRenderTargetInvalid(targets))
+        {
+            return;
+        }
+
+        var firstTarget = targets[0];
+        if (RenderTargetsMismatchedOrAliased(targets, firstTarget))
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Vulkan skipped MRT color clear with mismatched dimensions or aliased targets.");
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                return;
+            }
+
+            foreach (var target in targets)
+            {
+                var guestTextureFormat = GetGuestTextureFormat(
+                    target.Format,
+                    target.NumberType);
+                if (guestTextureFormat != 0)
+                {
+                    _availableGuestImages[target.Address] = guestTextureFormat;
+                }
+            }
+
+            var workSequence = EnqueueGuestWorkLocked(
+                new VulkanOffscreenColorClear(
+                    targets.ToArray(),
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                    shaderAddress));
+            foreach (var target in targets)
+            {
+                _guestImageWorkSequences[target.Address] = workSequence;
+            }
         }
     }
 
@@ -10158,6 +10227,133 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ExecuteOffscreenColorClear(VulkanOffscreenColorClear work)
+        {
+            if (_deviceLost || work.Targets.Count == 0)
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref _perfDrawCount);
+            PerfOverlay.RecordDraw();
+
+            var targetFormats = new VulkanRenderTargetFormat[work.Targets.Count];
+            for (var index = 0; index < targetFormats.Length; index++)
+            {
+                var target = work.Targets[index];
+                if (!TryDecodeRenderTargetFormat(target.Format, target.NumberType, out targetFormats[index]) ||
+                    !SupportsColorAttachment(targetFormats[index].Format))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan skipped color clear for unsupported target " +
+                        $"0x{target.Address:X16} format={target.Format} number_type={target.NumberType}.");
+                    return;
+                }
+            }
+
+            EnsureGuestSubmissionCapacity();
+            var commandBuffer = BeginBatchedGuestCommands();
+            CloseOpenTranslatedRenderPass();
+            var clearValue = new ClearColorValue(work.Red, work.Green, work.Blue, work.Alpha);
+
+            for (var index = 0; index < work.Targets.Count; index++)
+            {
+                var targetDescriptor = work.Targets[index];
+                var image = GetOrCreateGuestImage(
+                    targetDescriptor,
+                    targetFormats[index].Format);
+                if (TakeGuestImageInitialData(targetDescriptor.Address) is { } initialData &&
+                    !image.Initialized &&
+                    (ulong)initialData.Length ==
+                        (ulong)image.Width * image.Height * 4)
+                {
+                    UploadGuestImageInitialData(image, initialData);
+                }
+
+                var toTransferDst = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = image.Initialized ? AccessFlags.ShaderReadBit : 0,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = image.Initialized
+                        ? ImageLayout.ShaderReadOnlyOptimal
+                        : ImageLayout.Undefined,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(0, image.MipLevels),
+                };
+                _vk.CmdPipelineBarrier(
+                    commandBuffer,
+                    image.Initialized
+                        ? PipelineStageFlags.FragmentShaderBit
+                        : PipelineStageFlags.TopOfPipeBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toTransferDst);
+
+                var range = ColorSubresourceRange(0, image.MipLevels);
+                _vk.CmdClearColorImage(
+                    commandBuffer,
+                    image.Image,
+                    ImageLayout.TransferDstOptimal,
+                    &clearValue,
+                    1,
+                    &range);
+
+                var toShaderRead = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(0, image.MipLevels),
+                };
+                _vk.CmdPipelineBarrier(
+                    commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toShaderRead);
+                image.Initialized = true;
+
+                var guestTextureFormat = GetGuestTextureFormat(
+                    targetDescriptor.Format,
+                    targetDescriptor.NumberType);
+                if (guestTextureFormat != 0)
+                {
+                    lock (_gate)
+                    {
+                        _availableGuestImages[image.Address] = guestTextureFormat;
+                    }
+                }
+            }
+
+            if (_traceVulkanShaderEnabled)
+            {
+                TraceVulkanShader(
+                    $"vk.offscreen_color_clear mrt={work.Targets.Count} " +
+                    $"ps=0x{work.ShaderAddress:X16} " +
+                    $"rgba=({work.Red:0.###},{work.Green:0.###},{work.Blue:0.###},{work.Alpha:0.###})");
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
         private void ExecuteGuestImageWrite(VulkanGuestImageWrite work)
         {
             if (_deviceLost || !_guestImages.TryGetValue(work.Address, out var target))
@@ -11492,6 +11688,9 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         case VulkanOffscreenGuestDraw offscreenDraw:
                             ExecuteOffscreenDraw(offscreenDraw);
+                            break;
+                        case VulkanOffscreenColorClear colorClear:
+                            ExecuteOffscreenColorClear(colorClear);
                             break;
                         case VulkanComputeGuestDispatch computeDispatch:
                             ExecuteComputeDispatch(computeDispatch);
@@ -15058,6 +15257,11 @@ internal static unsafe class VulkanVideoPresenter
                     $"mrt={draw.Targets.Count} " +
                     $"textures={draw.Draw.Textures.Count} " +
                     $"vertices={draw.Draw.VertexCount} {queuePart}",
+                VulkanOffscreenColorClear clear =>
+                    $"offscreen_clear ps=0x{clear.ShaderAddress:X16} " +
+                    $"mrt={clear.Targets.Count} " +
+                    $"rgba=({clear.Red:0.###},{clear.Green:0.###},{clear.Blue:0.###},{clear.Alpha:0.###}) " +
+                    queuePart,
                 VulkanGuestImageWrite imageWrite =>
                     $"image_write addr=0x{imageWrite.Address:X16} {queuePart}",
                 VulkanOrderedGuestAction action =>
