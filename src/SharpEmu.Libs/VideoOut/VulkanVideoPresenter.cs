@@ -1624,7 +1624,7 @@ internal static unsafe class VulkanVideoPresenter
             (7, 0) => Format.B10G11R11UfloatPack32,
             (12, 0) => Format.R16G16B16A16Unorm,
             (13, 0) or (14, 0) => Format.R32G32B32A32Sfloat,
-            (22, 0) or (71, 0) => Format.R16G16B16A16Sfloat,
+            (22, _) or (71, _) => Format.R16G16B16A16Sfloat,
             (56, 0) or (62, 0) or (64, 0) => Format.R8G8B8A8Unorm,
             (75, 0) => Format.R32G32Sfloat,
             _ => Format.Undefined,
@@ -1649,7 +1649,7 @@ internal static unsafe class VulkanVideoPresenter
     }
 
     private static bool IsKnownGuestTextureFormat(uint format) =>
-        format is >= 1 and <= 19 or 34 or >= 169 and <= 182;
+        format is >= 1 and <= 19 or 22 or 34 or 71 or >= 169 and <= 182;
 
     private static byte[] CreateBlackFrame(uint width, uint height)
     {
@@ -5486,7 +5486,11 @@ internal static unsafe class VulkanVideoPresenter
                     // normals/IDs passes -> lighting had no input -> black).
                     if (texture.IsStorage && texture.Address != 0)
                     {
-                        _ = ResolveStorageGuestImage(texture);
+                        var storageFormat = GetTextureFormat(texture.Format, texture.NumberType);
+                        if (!ShouldKeepPublishedStorage(texture, storageFormat))
+                        {
+                            _ = ResolveStorageGuestImage(texture);
+                        }
                     }
                 }
 
@@ -5632,7 +5636,12 @@ internal static unsafe class VulkanVideoPresenter
                                 $"relative_level={texture.MipLevel}");
                         }
 
-                        _ = ResolveStorageGuestImage(texture);
+                        var storageFormat = GetTextureFormat(texture.Format, texture.NumberType);
+                        if (!ShouldKeepPublishedStorage(texture, storageFormat))
+                        {
+                            _ = ResolveStorageGuestImage(texture);
+                        }
+
                         if (traceResources)
                         {
                             TraceVulkanShader($"vk.compute_resources storage[{index}] ready");
@@ -6424,6 +6433,17 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
+            if (texture.Address != 0 &&
+                _guestImages.TryGetValue(texture.Address, out var publishedImage) &&
+                TryCreateOversizedAliasTextureResource(
+                    texture,
+                    publishedImage,
+                    vkFormat,
+                    out var oversizedAlias))
+            {
+                return oversizedAlias;
+            }
+
             if (ShouldTraceVulkanResources() && texture.Address != 0)
             {
                 if (_guestImages.TryGetValue(texture.Address, out var missImage))
@@ -6444,6 +6464,58 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             return GetOrCreateCachedTextureResource(texture);
+        }
+
+        private bool TryCreateOversizedAliasTextureResource(
+            GuestDrawTexture texture,
+            GuestImageResource guestImage,
+            Format requestedFormat,
+            out TextureResource resource)
+        {
+            resource = null!;
+            if (!guestImage.Initialized ||
+                guestImage.IsCpuBacked ||
+                texture.Width == 0 ||
+                texture.Height == 0 ||
+                (texture.Width <= guestImage.Width && texture.Height <= guestImage.Height))
+            {
+                return false;
+            }
+
+            // Bind the published image at its real extent. Normalized UVs still cover
+            // the content; avoid zero CPU uploads and avoid blit format conversion.
+            var viewFormat = IsCompatibleViewFormat(guestImage.Format, requestedFormat)
+                ? requestedFormat
+                : guestImage.Format;
+            if (!TryGetOrCreateGuestImageView(
+                    guestImage,
+                    viewFormat,
+                    mipLevel: 0,
+                    levelCount: guestImage.MipLevels,
+                    dstSelect: texture.DstSelect,
+                    out var view))
+            {
+                return false;
+            }
+
+            TraceVulkanShader(
+                $"vk.texture_oversized_alias addr=0x{texture.Address:X16} " +
+                $"texture={texture.Width}x{texture.Height} requested={requestedFormat} " +
+                $"image={guestImage.Width}x{guestImage.Height} source={guestImage.Format} " +
+                $"view={viewFormat}");
+            resource = new TextureResource
+            {
+                Address = texture.Address,
+                Image = guestImage.Image,
+                View = view,
+                Width = guestImage.Width,
+                Height = guestImage.Height,
+                RowLength = guestImage.Width,
+                DstSelect = texture.DstSelect,
+                SamplerState = texture.Sampler,
+                GuestImage = guestImage,
+            };
+            return true;
         }
 
         private bool TryCreateCpuTextureRefreshResource(
@@ -6852,8 +6924,17 @@ internal static unsafe class VulkanVideoPresenter
                 return CreateStorageScratchResource(texture);
             }
 
-            var guestImage = ResolveStorageGuestImage(texture);
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
+            // A published RT can sit at this address with a smaller extent / different
+            // format (e.g. 1080p R8G8, or 1920 HDR before a 2432 downsample). Recreating
+            // it as storage drops live content and can lose the device while draws still
+            // sample it. Keep the published image and give compute a scratch target.
+            if (TryKeepPublishedStorageScratch(texture, vkFormat, out var scratch))
+            {
+                return scratch;
+            }
+
+            var guestImage = ResolveStorageGuestImage(texture);
             var selectedMipLevel = GetStorageMipLevel(texture);
             var view = GetOrCreateGuestImageView(
                 guestImage,
@@ -7045,6 +7126,51 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             return guestImage;
+        }
+
+        private bool ShouldKeepPublishedStorage(
+            GuestDrawTexture texture,
+            Format storageFormat)
+        {
+            if (!_guestImages.TryGetValue(texture.Address, out var published) ||
+                !published.Initialized ||
+                published.IsCpuBacked)
+            {
+                return false;
+            }
+
+            var requiredMips = ClampMipLevels(
+                texture.Width,
+                texture.Height,
+                texture.ResourceMipLevels);
+            return published.Width != texture.Width ||
+                published.Height != texture.Height ||
+                published.Format != storageFormat ||
+                published.MipLevels < requiredMips;
+        }
+
+        private bool TryKeepPublishedStorageScratch(
+            GuestDrawTexture texture,
+            Format storageFormat,
+            out TextureResource scratch)
+        {
+            scratch = null!;
+            if (!ShouldKeepPublishedStorage(texture, storageFormat))
+            {
+                return false;
+            }
+
+            if (!_guestImages.TryGetValue(texture.Address, out var published))
+            {
+                return false;
+            }
+
+            TraceVulkanShader(
+                $"vk.storage_keep_published addr=0x{texture.Address:X16} " +
+                $"published={published.Width}x{published.Height}:{published.Format} " +
+                $"storage={texture.Width}x{texture.Height}:{storageFormat}");
+            scratch = CreateStorageScratchResource(texture);
+            return true;
         }
 
         private static uint GetStorageMipLevel(GuestDrawTexture texture)
@@ -8594,6 +8720,8 @@ internal static unsafe class VulkanVideoPresenter
                 10 => 4UL,
                 11 => 8UL,
                 12 => 8UL,
+                22 => 8UL,
+                71 => 8UL,
                 13 => 12UL,
                 14 => 16UL,
                 _ => 4UL,
@@ -8672,6 +8800,8 @@ internal static unsafe class VulkanVideoPresenter
                 (12, 4) => Format.R16G16B16A16Uint,
                 (12, 5) => Format.R16G16B16A16Sint,
                 (12, 7) => Format.R16G16B16A16Sfloat,
+                (22, _) => Format.R16G16B16A16Sfloat,
+                (71, _) => Format.R16G16B16A16Sfloat,
                 (13, 4) => Format.R32G32B32A32Uint,
                 (13, 5) => Format.R32G32B32A32Sint,
                 (13, _) => Format.R32G32B32A32Sfloat,
@@ -8725,6 +8855,8 @@ internal static unsafe class VulkanVideoPresenter
                 (12, 4) => Format.R16G16B16A16Uint,
                 (12, 5) => Format.R16G16B16A16Sint,
                 (12, 7) => Format.R16G16B16A16Sfloat,
+                (22, _) => Format.R16G16B16A16Sfloat,
+                (71, _) => Format.R16G16B16A16Sfloat,
                 (13, 7) => Format.R32G32B32A32Sfloat,
                 (14, 7) => Format.R32G32B32A32Sfloat,
                 (_, 0) => GetTextureFormat(format, numberType),
@@ -8843,6 +8975,20 @@ internal static unsafe class VulkanVideoPresenter
                     $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
                     $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
                     $"textures={work.Textures.Count}");
+                return;
+            }
+
+            // Astro Bot downsample CS 0x5009A2500 is safe at 1920x1080 (120x68 /
+            // 60x34 groups). The first 2432x1368 dispatch (152x86) has repeatedly
+            // lost the Vulkan device on QueueSubmit; soft-skip oversized runs.
+            if (work.ShaderAddress == 0x0000_0005_009A_2500UL &&
+                (work.GroupCountX > 120 || work.GroupCountY > 68))
+            {
+                LogRejectedComputeDispatch(work, "astro-downsample-oversized-groups");
+                TraceVulkanShader(
+                    $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
+                    $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                    $"reason=astro-downsample-oversized-groups");
                 return;
             }
 
@@ -10234,6 +10380,24 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // Astro Bot's procedural clear is safe at 1080p. The first 2432x1368
+            // offscreen clears still trip ErrorDeviceLost on QueueSubmit even via
+            // CmdClearColorImage; soft-skip oversized targets so title present stays
+            // alive past the internal-res switch.
+            for (var index = 0; index < work.Targets.Count; index++)
+            {
+                var target = work.Targets[index];
+                if (target.Width > 1920 || target.Height > 1080)
+                {
+                    TraceVulkanShader(
+                        $"vk.offscreen_color_clear_skip ps=0x{work.ShaderAddress:X16} " +
+                        $"addr=0x{target.Address:X16} " +
+                        $"size={target.Width}x{target.Height} " +
+                        $"reason=astro-oversized-clear");
+                    return;
+                }
+            }
+
             Interlocked.Increment(ref _perfDrawCount);
             PerfOverlay.RecordDraw();
 
@@ -10273,9 +10437,13 @@ internal static unsafe class VulkanVideoPresenter
                 var toTransferDst = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = image.Initialized ? AccessFlags.ShaderReadBit : 0,
+                    SrcAccessMask =
+                        image.Initialized || image.InitialUploadPending
+                        ? AccessFlags.ShaderReadBit
+                        : 0,
                     DstAccessMask = AccessFlags.TransferWriteBit,
-                    OldLayout = image.Initialized
+                    OldLayout =
+                        image.Initialized || image.InitialUploadPending
                         ? ImageLayout.ShaderReadOnlyOptimal
                         : ImageLayout.Undefined,
                     NewLayout = ImageLayout.TransferDstOptimal,
@@ -10286,7 +10454,7 @@ internal static unsafe class VulkanVideoPresenter
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
-                    image.Initialized
+                    image.Initialized || image.InitialUploadPending
                         ? PipelineStageFlags.FragmentShaderBit
                         : PipelineStageFlags.TopOfPipeBit,
                     PipelineStageFlags.TransferBit,
@@ -10331,6 +10499,7 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     &toShaderRead);
                 image.Initialized = true;
+                image.InitialUploadPending = false;
 
                 var guestTextureFormat = GetGuestTextureFormat(
                     targetDescriptor.Format,
@@ -10777,6 +10946,11 @@ internal static unsafe class VulkanVideoPresenter
                 RenderPass = renderPass,
                 InitialRenderPass = initialRenderPass,
                 Framebuffer = framebuffer,
+                // TransitionNewGuestImageToSampled already moved the image to
+                // ShaderReadOnlyOptimal. Barriers that assume Undefined on
+                // !Initialized (e.g. offscreen color clear) otherwise lose the
+                // device on the first large RT create — notably Astro 2432x1368.
+                InitialUploadPending = true,
             };
             var debugName = GuestImageDebugName(target, format);
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");

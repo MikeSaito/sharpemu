@@ -3500,11 +3500,31 @@ public static partial class AgcExports
                     VideoOutExports.TryGetDisplayBufferInfo(
                         handle,
                         displayBufferIndex,
-                        out var pendingDisplayBuffer) &&
-                    state.KnownRenderTargets.TryGetValue(
-                        pendingDisplayBuffer.Address,
-                        out var pendingDisplayTarget))
+                        out var pendingDisplayBuffer))
                 {
+                    // Astro/Unity often omit CB for the final blit and only name
+                    // the scanout target on RFlip. Synthesize a display RT when
+                    // the address was never seen as a CB render target.
+                    if (!state.KnownRenderTargets.TryGetValue(
+                            pendingDisplayBuffer.Address,
+                            out var pendingDisplayTarget))
+                    {
+                        var displayFormat = VideoOutExports.IsPacked10BitPixelFormat(
+                                pendingDisplayBuffer.PixelFormat)
+                            ? 9u
+                            : 10u;
+                        pendingDisplayTarget = new RenderTargetDescriptor(
+                            Slot: 0,
+                            pendingDisplayBuffer.Address,
+                            pendingDisplayBuffer.Width,
+                            pendingDisplayBuffer.Height,
+                            displayFormat,
+                            NumberType: 0,
+                            pendingDisplayBuffer.TilingMode);
+                        state.KnownRenderTargets[pendingDisplayBuffer.Address] =
+                            pendingDisplayTarget;
+                    }
+
                     var textures = CreateGuestDrawTextures(
                         ctx,
                         pendingComposite.Textures,
