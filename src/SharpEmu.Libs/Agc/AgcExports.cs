@@ -201,6 +201,7 @@ public static partial class AgcExports
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
+    private static readonly HashSet<ulong> _tracedEmptySrtDrawRejects = new();
     private static readonly HashSet<(ulong Address, uint X, uint Y, uint Z)>
         _tracedDispatchArguments = new();
     private static readonly HashSet<(ulong Address, uint Initiator, string Reason)>
@@ -6216,6 +6217,53 @@ public static partial class AgcExports
             return false;
         }
 
+        // Empty SRT/EUD with no guest-backed images/globals collapses into
+        // Address-0 fallback descriptors. Submitting that offscreen batch
+        // (ps=0x808E88000 → 2432x1368) loses the Vulkan device after Astro
+        // Bot's first presented frame. Prefer skip over QueueSubmit.
+        if (pixelState.Metadata is
+            {
+                ShaderResourceTableSizeDwords: 0,
+                ExtendedUserDataSizeDwords: 0,
+            } ||
+            Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(
+                pixelShaderAddress))
+        {
+            var hasUsablePixelImage = false;
+            foreach (var binding in pixelEvaluation.ImageBindings)
+            {
+                if (TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture) &&
+                    texture.Address != 0)
+                {
+                    hasUsablePixelImage = true;
+                    break;
+                }
+            }
+
+            var hasUsablePixelGlobal = pixelEvaluation.GlobalMemoryBindings.Any(
+                static binding => binding.BaseAddress != 0);
+            if (!hasUsablePixelImage && !hasUsablePixelGlobal)
+            {
+                error = Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(
+                    pixelShaderAddress)
+                    ? "empty-srt-scalar-pointer-fallback"
+                    : "empty-srt-no-usable-resources";
+                lock (_submitTraceGate)
+                {
+                    if (_tracedEmptySrtDrawRejects.Add(pixelShaderAddress))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] agc.draw_reject ps=0x{pixelShaderAddress:X16} " +
+                            $"es=0x{exportShaderAddress:X16} reason={error}");
+                    }
+                }
+
+                ReturnPooledEvaluationArrays(exportEvaluation);
+                ReturnPooledEvaluationArrays(pixelEvaluation);
+                return false;
+            }
+        }
+
         if (pixelShaderAddress == 0x0000000500781200 &&
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TITLE_GLOBALS") == "1")
         {
@@ -8857,7 +8905,35 @@ public static partial class AgcExports
         var gpuDispatch = false;
         var evaluationHandledByCpu = false;
         var computeError = string.Empty;
-        if (!hasStorageBinding &&
+        // Empty SRT/EUD with a recorded null-base scalar pointer fallback
+        // produces Address-0 storage that can lose the Vulkan device on submit.
+        var emptyResourceTables =
+            shaderState.Metadata is
+            {
+                ShaderResourceTableSizeDwords: 0,
+                ExtendedUserDataSizeDwords: 0,
+            };
+        if (emptyResourceTables &&
+            (Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(shaderAddress) ||
+             (translatedBindings.All(static binding => binding.Descriptor.Address == 0) &&
+              !evaluation.GlobalMemoryBindings.Any(static binding => binding.BaseAddress != 0))))
+        {
+            computeError = Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(shaderAddress)
+                ? "empty-srt-scalar-pointer-fallback"
+                : "empty-srt-no-usable-resources";
+            lock (_submitTraceGate)
+            {
+                if (_tracedComputeShaders.Add(shaderAddress))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] agc.compute_reject cs=0x{shaderAddress:X16} " +
+                        $"source={(dispatch.IsIndirect ? "indirect" : "direct")} " +
+                        $"groups={dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ} " +
+                        $"reason={computeError}");
+                }
+            }
+        }
+        else if (!hasStorageBinding &&
             writesGlobalMemory &&
             TrySubmitMaskedDwordCopyKernel(
                 ctx,
