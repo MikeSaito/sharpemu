@@ -80,7 +80,7 @@ public static class Gen5ShaderTranslator
     public static bool IsScalarConsumed(ulong[] mask, uint register) =>
         register < 256 && (mask[register >> 6] & (1UL << (int)(register & 63))) != 0;
 
-    private const int MaxInstructions = 4096;
+    private const int MaxInstructions = 16384;
     private const uint PsUserDataRegister = 0x0C;
     private const uint VsUserDataRegister = 0x4C;
     private const uint GsUserDataRegister = 0x8C;
@@ -439,7 +439,8 @@ public static class Gen5ShaderTranslator
 
         var instructions = new List<Gen5ShaderInstruction>();
         var instructionCount = 0;
-        for (uint pc = 0; instructionCount < MaxInstructions;)
+        uint pc = 0;
+        for (; instructionCount < MaxInstructions;)
         {
             if (!TryReadUInt32(ctx, address + pc, out var word))
             {
@@ -482,7 +483,14 @@ public static class Gen5ShaderTranslator
             }
         }
 
-        error = "unterminated";
+        static string Summarize(IEnumerable<Gen5ShaderInstruction> source) =>
+            string.Join(',', source.Select(static instruction => instruction.Opcode));
+
+        var first = Summarize(instructions.Take(12));
+        var last = Summarize(instructions.TakeLast(12));
+        error =
+            $"unterminated count={instructionCount} last_pc=0x{pc:X} " +
+            $"first=[{first}] last=[{last}]";
         return false;
     }
 
@@ -874,6 +882,13 @@ public static class Gen5ShaderTranslator
             0x0E => "SCmpkLeU32",
             0x0F => "SAddkI32",
             0x10 => "SMulkI32",
+            // GFX10 SOPK waitcnt / hwreg (LLVM SOPInstructions.td).
+            0x12 => "SGetregB32",
+            0x13 => "SSetregB32",
+            0x17 => "SWaitcntVscnt",
+            0x18 => "SWaitcntVmcnt",
+            0x19 => "SWaitcntExpcnt",
+            0x1A => "SWaitcntLgkmcnt",
             _ => string.Empty,
         };
 
@@ -1116,6 +1131,8 @@ public static class Gen5ShaderTranslator
             0x145 => "VCubescF32",
             0x146 => "VCubetcF32",
             0x147 => "VCubemaF32",
+            0x148 => "VBfeU32",
+            0x149 => "VBfeI32",
             0x14A => "VBfiB32",
             0x14B => "VFmaF32",
             0x151 => "VMin3F32",
@@ -1132,7 +1149,6 @@ public static class Gen5ShaderTranslator
             0x15C => "VSadU16",
             0x15D => "VSadU32",
             0x15E => "VCvtPkU8F32",
-            0x148 => "VBfeU32",
             0x169 => "VMulLoU32",
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
@@ -1220,7 +1236,11 @@ public static class Gen5ShaderTranslator
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
+            0x3D => "DsConsume",
+            0x3E => "DsAppend",
+            0x3F => "DsOrderedCount",
             0x4D => "DsWriteB64",
+            0x76 => "DsReadB64",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
             0xFE => "DsReadB96",
@@ -1563,6 +1583,15 @@ public static class Gen5ShaderTranslator
         _ => false,
     };
 
+    /// <summary>
+    /// True when any DS op targets GDS (global data share). Astro's binning
+    /// path uses ds_append against GDS to allocate indirect-dispatch slots.
+    /// </summary>
+    public static bool ProgramUsesGds(Gen5ShaderProgram program) =>
+        program.Instructions.Any(
+            static instruction =>
+                instruction.Control is Gen5DataShareControl { Gds: true });
+
     private static Gen5ShaderInstruction CreateInstruction(
         uint pc,
         Gen5ShaderEncoding encoding,
@@ -1897,6 +1926,9 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData1),
                     ],
                     "DsSwizzleB32" => [Gen5Operand.Vector(vectorData0)],
+                    // ds_append / ds_consume / ds_ordered_count take the GDS
+                    // address from M0 (+ OFFSET), not from a VGPR ADDR.
+                    "DsAppend" or "DsConsume" or "DsOrderedCount" => [],
                     // DS_CMPST operand order is reversed vs buffer/image cmpswap:
                     // DATA0 holds the comparator, DATA1 holds the new value.
                     "DsCmpstB32" or "DsCmpstRtnB32" => [
@@ -1915,7 +1947,7 @@ public static class Gen5ShaderTranslator
                     "DsReadB32" or "DsSwizzleB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsRead2B32" or "DsRead2St64B32" => [
+                    "DsReadB64" or "DsRead2B32" or "DsRead2St64B32" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
                     ],
@@ -1929,6 +1961,9 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorDestination + 1),
                         Gen5Operand.Vector(vectorDestination + 2),
                         Gen5Operand.Vector(vectorDestination + 3),
+                    ],
+                    "DsAppend" or "DsConsume" or "DsOrderedCount" => [
+                        Gen5Operand.Vector(vectorDestination),
                     ],
                     _ when IsDataShareAtomic(opcode) &&
                         opcode.Contains("Rtn", StringComparison.Ordinal) => [

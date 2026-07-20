@@ -899,6 +899,21 @@ public static partial class Gen5SpirvTranslator
                         width);
                     break;
                 }
+                case "VBfeI32":
+                {
+                    // GFX VOP3 v_bfe_i32: sign-extending bitfield extract.
+                    // Same src layout as v_bfe_u32 (value, offset, width).
+                    var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    var offset = BitwiseAnd(GetRawSource(instruction, 1), UInt(31));
+                    var signed = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        offset,
+                        width);
+                    result = Bitcast(_uintType, signed);
+                    break;
+                }
                 case "VBfiB32":
                 {
                     var mask = GetRawSource(instruction, 0);
@@ -1261,6 +1276,8 @@ public static partial class Gen5SpirvTranslator
                         _uintType,
                         current,
                         UInt(immediate)),
+                    // HW register read; host has no MODE/STATUS — zero is safe for control flow.
+                    "SGetregB32" => UInt(0),
                     _ => 0u,
                 };
                 if (value == 0)

@@ -224,6 +224,7 @@ public static partial class Gen5SpirvTranslator
         private readonly int _totalGlobalBufferCount;
         private readonly int _imageBindingBase;
         private readonly int _initialScalarBufferIndex;
+        private readonly int _gdsBufferIndex;
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
         private readonly ulong _storageBufferOffsetAlignment;
@@ -350,6 +351,13 @@ public static partial class Gen5SpirvTranslator
                 : totalGlobalBufferCount;
             _imageBindingBase = imageBindingBase;
             _initialScalarBufferIndex = initialScalarBufferIndex;
+            // GDS is the last guestBuffers[] slot when the caller reserved one
+            // for ProgramUsesGds. Append/Consume index that buffer with device
+            // scope atomics so counters survive across workgroups/dispatches.
+            _gdsBufferIndex = Gen5ShaderTranslator.ProgramUsesGds(state.Program) &&
+                _totalGlobalBufferCount > 0
+                ? _totalGlobalBufferCount - 1
+                : -1;
             _pixelInputEnable = pixelInputEnable;
             _pixelInputAddress = pixelInputAddress;
             if (storageBufferOffsetAlignment == 0 ||
@@ -1736,6 +1744,11 @@ public static partial class Gen5SpirvTranslator
             if (instruction.Opcode is
                 "SNop" or
                 "SWaitcnt" or
+                "SWaitcntVscnt" or
+                "SWaitcntVmcnt" or
+                "SWaitcntExpcnt" or
+                "SWaitcntLgkmcnt" or
+                "SSetregB32" or
                 "SInstPrefetch" or
                 "STtraceData" or
                 "VInterpMovF32")
@@ -1815,9 +1828,7 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (_lds == 0 ||
-                _ldsElementPointer == 0 ||
-                instruction.Control is not Gen5DataShareControl control)
+            if (instruction.Control is not Gen5DataShareControl control)
             {
                 error = "invalid LDS instruction";
                 return false;
@@ -1825,7 +1836,12 @@ public static partial class Gen5SpirvTranslator
 
             if (control.Gds)
             {
-                error = "GDS data share is not implemented";
+                return TryEmitGdsDataShare(instruction, control, out error);
+            }
+
+            if (_lds == 0 || _ldsElementPointer == 0)
+            {
+                error = "invalid LDS instruction";
                 return false;
             }
 
@@ -1923,6 +1939,25 @@ public static partial class Gen5SpirvTranslator
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
+                case "DsReadB64":
+                {
+                    if (instruction.Destinations.Count < 2 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS read64 operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var offset = control.Offset0;
+                    StoreV(
+                        instruction.Destinations[0].Value,
+                        Load(_uintType, LdsPointer(address, offset)));
+                    StoreV(
+                        instruction.Destinations[1].Value,
+                        Load(_uintType, LdsPointer(address, offset + sizeof(uint))));
+                    return true;
+                }
                 case "DsReadB96":
                 case "DsReadB128":
                 {
@@ -1981,6 +2016,138 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     error = $"unsupported LDS opcode {instruction.Opcode}";
+                    return false;
+            }
+        }
+
+        private bool TryEmitGdsDataShare(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (_gdsBufferIndex < 0 || _globalBuffers == 0)
+            {
+                error = "GDS buffer slot was not reserved for this shader";
+                return false;
+            }
+
+            // M0 (SGPR 124) holds the GDS base; OFFSET0 is added in bytes.
+            const uint m0Register = 124;
+            var addressBytes = control.Offset0 == 0
+                ? LoadS(m0Register)
+                : IAdd(LoadS(m0Register), UInt(control.Offset0));
+            var dwordAddress = ShiftRightLogical(addressBytes, UInt(2));
+            var pointer = BufferWordPointer(_gdsBufferIndex, dwordAddress);
+            // Device scope + UniformMemory so append counters are visible to
+            // every workgroup and to later dispatches that share the buffer.
+            const uint deviceScope = 1;
+            const uint uniformAcquireRelease = 0x48;
+
+            switch (instruction.Opcode)
+            {
+                case "DsAppend":
+                case "DsOrderedCount":
+                {
+                    if (instruction.Destinations.Count < 1)
+                    {
+                        error = $"missing GDS {instruction.Opcode} destination";
+                        return false;
+                    }
+
+                    EmitExecConditional(() =>
+                    {
+                        var previous = EmitAtomic(
+                            SpirvOp.AtomicIAdd,
+                            _uintType,
+                            pointer,
+                            deviceScope,
+                            uniformAcquireRelease,
+                            value: () => UInt(1),
+                            comparator: () => UInt(0));
+                        StoreV(instruction.Destinations[0].Value, previous);
+                    });
+                    return true;
+                }
+                case "DsConsume":
+                {
+                    if (instruction.Destinations.Count < 1)
+                    {
+                        error = "missing GDS consume destination";
+                        return false;
+                    }
+
+                    EmitExecConditional(() =>
+                    {
+                        var previous = EmitAtomic(
+                            SpirvOp.AtomicISub,
+                            _uintType,
+                            pointer,
+                            deviceScope,
+                            uniformAcquireRelease,
+                            value: () => UInt(1),
+                            comparator: () => UInt(0));
+                        StoreV(instruction.Destinations[0].Value, previous);
+                    });
+                    return true;
+                }
+                default:
+                    if (Gen5ShaderTranslator.IsDataShareAtomic(instruction.Opcode))
+                    {
+                        var atomicOp = instruction.Opcode switch
+                        {
+                            "DsAddU32" or "DsAddRtnU32" => SpirvOp.AtomicIAdd,
+                            "DsSubU32" or "DsSubRtnU32" => SpirvOp.AtomicISub,
+                            "DsIncU32" or "DsIncRtnU32" => SpirvOp.AtomicIIncrement,
+                            "DsDecU32" or "DsDecRtnU32" => SpirvOp.AtomicIDecrement,
+                            "DsMinI32" or "DsMinRtnI32" => SpirvOp.AtomicSMin,
+                            "DsMaxI32" or "DsMaxRtnI32" => SpirvOp.AtomicSMax,
+                            "DsMinU32" or "DsMinRtnU32" => SpirvOp.AtomicUMin,
+                            "DsMaxU32" or "DsMaxRtnU32" => SpirvOp.AtomicUMax,
+                            "DsAndB32" or "DsAndRtnB32" => SpirvOp.AtomicAnd,
+                            "DsOrB32" or "DsOrRtnB32" => SpirvOp.AtomicOr,
+                            "DsXorB32" or "DsXorRtnB32" => SpirvOp.AtomicXor,
+                            "DsWrxchgRtnB32" => SpirvOp.AtomicExchange,
+                            "DsCmpstB32" or "DsCmpstRtnB32" => SpirvOp.AtomicCompareExchange,
+                            _ => SpirvOp.Nop,
+                        };
+                        if (atomicOp == SpirvOp.Nop)
+                        {
+                            error = $"unsupported GDS opcode {instruction.Opcode}";
+                            return false;
+                        }
+
+                        var gdsAddress = instruction.Sources.Count > 0
+                            ? (control.Offset0 == 0
+                                ? GetRawSource(instruction, 0)
+                                : IAdd(
+                                    GetRawSource(instruction, 0),
+                                    UInt(control.Offset0)))
+                            : addressBytes;
+                        var gdsPointer = BufferWordPointer(
+                            _gdsBufferIndex,
+                            ShiftRightLogical(gdsAddress, UInt(2)));
+                        EmitExecConditional(() =>
+                        {
+                            var original = EmitAtomic(
+                                atomicOp,
+                                _uintType,
+                                gdsPointer,
+                                deviceScope,
+                                uniformAcquireRelease,
+                                value: () => GetRawSource(
+                                    instruction,
+                                    atomicOp == SpirvOp.AtomicCompareExchange ? 2 : 1),
+                                comparator: () => GetRawSource(instruction, 1));
+                            if (instruction.Destinations.Count > 0)
+                            {
+                                StoreV(instruction.Destinations[0].Value, original);
+                            }
+                        });
+                        return true;
+                    }
+
+                    error = $"unsupported GDS opcode {instruction.Opcode}";
                     return false;
             }
         }

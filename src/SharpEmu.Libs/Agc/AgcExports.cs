@@ -8439,28 +8439,66 @@ public static partial class AgcExports
 
     /// <summary>
     /// Guest storage buffers for a compute dispatch followed by its initial
-    /// scalar registers. Dispatch-specific SGPR values remain runtime data so
-    /// one translated pipeline serves every matching shader/resource shape.
+    /// scalar registers, then an optional GDS emulation buffer. Dispatch-
+    /// specific SGPR values remain runtime data so one translated pipeline
+    /// serves every matching shader/resource shape. GDS occupies a stable
+    /// high guest address so the presenter keeps one mapped allocation across
+    /// dispatches (append counters must survive workgroup boundaries).
     /// </summary>
     private static IReadOnlyList<GuestMemoryBuffer> CreateTranslatedComputeGlobalBuffers(
-        Gen5ShaderEvaluation evaluation)
+        Gen5ShaderEvaluation evaluation,
+        bool needsGds = false)
     {
         var buffers = CreateGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
-        if (_bakeScalars)
+        var extra = (_bakeScalars ? 0 : 1) + (needsGds ? 1 : 0);
+        if (extra == 0)
         {
             return buffers;
         }
 
-        var combined = new List<GuestMemoryBuffer>(buffers.Count + 1);
+        var combined = new List<GuestMemoryBuffer>(buffers.Count + extra);
         combined.AddRange(buffers);
-        combined.Add(new GuestMemoryBuffer(
-            0,
-            PackRuntimeScalarState(
-                evaluation.InitialScalarRegisters,
-                evaluation.GlobalMemoryBindings),
-            GetRuntimeScalarBufferLength(evaluation.GlobalMemoryBindings.Count),
-            Pooled: true));
+        if (!_bakeScalars)
+        {
+            combined.Add(new GuestMemoryBuffer(
+                0,
+                PackRuntimeScalarState(
+                    evaluation.InitialScalarRegisters,
+                    evaluation.GlobalMemoryBindings),
+                GetRuntimeScalarBufferLength(evaluation.GlobalMemoryBindings.Count),
+                Pooled: true));
+        }
+
+        if (needsGds)
+        {
+            combined.Add(CreateGdsEmulationBuffer());
+        }
+
         return combined;
+    }
+
+    // High canonical address outside the guest VA used by Astro so the Vulkan
+    // presenter treats GDS as a normal writable guest-buffer allocation that
+    // persists across compute dispatches on the same queue.
+    private const ulong GdsEmulationBaseAddress = 0xFFFF_FFFE_0000_0000UL;
+    private const int GdsEmulationBytes = 64 * 1024;
+    private static readonly byte[] GdsEmulationData = new byte[GdsEmulationBytes];
+    private static readonly object GdsEmulationGate = new();
+
+    private static GuestMemoryBuffer CreateGdsEmulationBuffer()
+    {
+        lock (GdsEmulationGate)
+        {
+            // Share one zero-filled host array; the presenter maps it once and
+            // then keeps GPU-side contents when the snapshot still matches.
+            return new GuestMemoryBuffer(
+                GdsEmulationBaseAddress,
+                GdsEmulationData,
+                GdsEmulationBytes,
+                Pooled: false,
+                Writable: true,
+                WriteBackToGuest: false);
+        }
     }
 
     private static IReadOnlyList<GuestVertexBuffer> CreateGuestVertexBuffers(
@@ -9654,9 +9692,10 @@ public static partial class AgcExports
                 dispatch.WaveLaneCount,
                 VulkanVideoPresenter.GuestStorageBufferOffsetAlignment);
             var guestGlobalBufferCount = evaluation.GlobalMemoryBindings.Count;
-            var totalGlobalBufferCount = _bakeScalars
-                ? guestGlobalBufferCount
-                : guestGlobalBufferCount + 1;
+            var needsGds = Gen5ShaderTranslator.ProgramUsesGds(shaderState.Program);
+            var totalGlobalBufferCount = guestGlobalBufferCount +
+                (_bakeScalars ? 0 : 1) +
+                (needsGds ? 1 : 0);
             _computeShaderCache.TryGetValue(shaderKey, out var computeShader);
 
             if (computeShader is null &&
@@ -9693,7 +9732,7 @@ public static partial class AgcExports
                     translatedBindings,
                     out _);
                 var globalMemoryBuffers =
-                    CreateTranslatedComputeGlobalBuffers(evaluation);
+                    CreateTranslatedComputeGlobalBuffers(evaluation, needsGds);
                 var workSequence = GuestGpu.Current.SubmitComputeDispatch(
                     shaderAddress,
                     computeShader,

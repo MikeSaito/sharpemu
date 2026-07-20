@@ -8117,7 +8117,7 @@ internal static unsafe class VulkanVideoPresenter
                 ranges.Add((
                     alignedStart,
                     paddedEnd,
-                    buffer.Writable && buffer.WriteBackToGuest));
+                    buffer.Writable));
             }
 
             if (ranges.Count == 0)

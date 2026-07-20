@@ -1125,6 +1125,22 @@ public static class Gen5ShaderScalarEvaluator
             return false;
         }
 
+        if (instruction.Opcode is
+            "SWaitcntVscnt" or
+            "SWaitcntVmcnt" or
+            "SWaitcntExpcnt" or
+            "SWaitcntLgkmcnt" or
+            "SSetregB32")
+        {
+            return true;
+        }
+
+        if (instruction.Opcode == "SGetregB32")
+        {
+            registers[destination.Value] = 0;
+            return true;
+        }
+
         if (instruction.Opcode == "SMovkI32")
         {
             registers[destination.Value] = unchecked((uint)(short)instruction.Sources[0].Value);
