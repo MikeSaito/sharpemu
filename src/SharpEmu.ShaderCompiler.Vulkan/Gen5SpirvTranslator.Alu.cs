@@ -1300,6 +1300,37 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            // Must run before EndsWith("B64") — name ends with B64 but returns i32.
+            if (instruction.Opcode == "SFF1I32B64")
+            {
+                var src64 = GetRawSource64(instruction, 0);
+                var lowMask = _module.AddInstruction(SpirvOp.UConvert, _uintType, src64);
+                var highMask = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    ShiftRightLogical64(src64, _module.Constant64(_ulongType, 32)));
+                var hasLow = IsNotZero(lowMask);
+                var hasHigh = IsNotZero(highMask);
+                var firstLow = Ext(73, _uintType, lowMask);
+                var firstHigh = IAdd(UInt(32), Ext(73, _uintType, highMask));
+                var ff1Result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    hasLow,
+                    firstLow,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        hasHigh,
+                        firstHigh,
+                        UInt(unchecked((uint)-1))));
+                StoreS(destination, ff1Result);
+                Store(
+                    _scc,
+                    _module.AddInstruction(SpirvOp.LogicalOr, _boolType, hasLow, hasHigh));
+                return true;
+            }
+
             if (instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ||
                 instruction.Opcode is "SWqmB64" or "SBfeU64" or "SBfeI64")
             {
@@ -1771,6 +1802,17 @@ public static partial class Gen5SpirvTranslator
                             SpirvOp.LogicalNot,
                             _boolType,
                             isSet));
+                return true;
+            }
+
+            if (instruction.Opcode is "SCmpEqU64" or "SCmpLgU64")
+            {
+                var left64 = GetRawSource64(instruction, 0);
+                var right64 = GetRawSource64(instruction, 1);
+                var op = instruction.Opcode == "SCmpEqU64"
+                    ? SpirvOp.IEqual
+                    : SpirvOp.INotEqual;
+                Store(_scc, _module.AddInstruction(op, _boolType, left64, right64));
                 return true;
             }
 

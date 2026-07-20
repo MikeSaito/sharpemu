@@ -704,6 +704,7 @@ public static class Gen5ShaderTranslator
             0x0B => "SBrevB32",
             0x0F => "SBcnt1I32B32",
             0x13 => "SFF1I32B32",
+            0x14 => "SFF1I32B64",
             0x1D => "SBitset1B32",
             0x1F => "SGetpcB64",
             0x20 => "SSetpcB64",
@@ -825,6 +826,9 @@ public static class Gen5ShaderTranslator
             0x0D => "SBitcmp1B32",
             0x0E => "SBitcmp0B64",
             0x0F => "SBitcmp1B64",
+            // GFX8+ 64-bit scalar compares (LLVM SOPC_Real_gfx8_gfx9_gfx10).
+            0x12 => "SCmpEqU64",
+            0x13 => "SCmpLgU64",
             _ => string.Empty,
         };
 
@@ -850,6 +854,8 @@ public static class Gen5ShaderTranslator
             0x0A => "SBarrier",
             0x0C => "SWaitcnt",
             0x10 => "SSendmsg",
+            // GFX SOPP s_trap — host has no privileged trap; treat as nop.
+            0x12 => "STrap",
             0x16 => "STtraceData",
             0x20 => "SInstPrefetch",
             0x21 => "SClause",
@@ -1450,7 +1456,8 @@ public static class Gen5ShaderTranslator
 
     private static bool DecodeMimg(uint word, out string name, out uint sizeDwords, out string error)
     {
-        var opcode = (word >> 18) & 0x7F;
+        // GFX6-10 pack OP[7] in bit0 and OP[6:0] in bits[24:18] (MIMGe_gfx10).
+        var opcode = ((word & 1u) << 7) | ((word >> 18) & 0x7F);
         sizeDwords = 2 + ((word >> 1) & 0x3);
         error = string.Empty;
         name = opcode switch
@@ -1488,6 +1495,10 @@ public static class Gen5ShaderTranslator
             0x4E => "ImageGather4CBCl",
             0x57 => "ImageGather4LzO",
             0x5F => "ImageGather4CLzO",
+            0x60 => "ImageGetLod",
+            // GFX10 BVH ray intersect (OP high bit in word bit0 → 0xE6/0xE7).
+            0xE6 => "ImageBvhIntersectRay",
+            0xE7 => "ImageBvh64IntersectRay",
             _ => string.Empty,
         };
 

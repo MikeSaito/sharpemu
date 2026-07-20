@@ -610,6 +610,14 @@ public static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
+            // BVH intersect is stubbed in SPIR-V; skip descriptor binding discovery.
+            if (instruction.Opcode is
+                "ImageBvhIntersectRay" or
+                "ImageBvh64IntersectRay")
+            {
+                continue;
+            }
+
             if (path.Supplemental && resolvedImageByPc.ContainsKey(instruction.Pc))
             {
                 continue;
@@ -1381,6 +1389,21 @@ public static class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode == "SFF1I32B64")
+        {
+            if (!TryEvaluateScalarOperand64(instruction.Sources[0], registers, ulong.MaxValue, out var wide))
+            {
+                error = $"scalar-ff1-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            registers[destination.Value] = wide == 0
+                ? uint.MaxValue
+                : (uint)BitOperations.TrailingZeroCount(wide);
+            scalarConditionCode = registers[destination.Value] != 0;
+            return true;
+        }
+
         if (instruction.Sources.Count < 2 ||
             !TryEvaluateScalarOperand(
                 instruction.Sources[1],
@@ -1780,6 +1803,21 @@ public static class Gen5ShaderScalarEvaluator
             var bit = (int)(right & 63u);
             var isSet = ((wide >> bit) & 1UL) != 0;
             scalarConditionCode = instruction.Opcode == "SBitcmp1B64" ? isSet : !isSet;
+            return true;
+        }
+
+        if (instruction.Opcode is "SCmpEqU64" or "SCmpLgU64")
+        {
+            if (!TryEvaluateScalarOperand64(instruction.Sources[0], registers, ulong.MaxValue, out var left64) ||
+                !TryEvaluateScalarOperand64(instruction.Sources[1], registers, ulong.MaxValue, out var right64))
+            {
+                error = $"scalar-compare-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            scalarConditionCode = instruction.Opcode == "SCmpEqU64"
+                ? left64 == right64
+                : left64 != right64;
             return true;
         }
 

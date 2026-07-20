@@ -1743,6 +1743,7 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             if (instruction.Opcode is
                 "SNop" or
+                "STrap" or
                 "SWaitcnt" or
                 "SWaitcntVscnt" or
                 "SWaitcntVmcnt" or
@@ -3384,6 +3385,28 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+
+            // BVH ray intersect needs a traversal unit we do not emulate yet.
+            // Write a miss (all-zero hit payload) so mesh/bin CS can continue
+            // past image_bvh*_intersect_ray instead of failing decode/emit.
+            if (instruction.Opcode is
+                "ImageBvhIntersectRay" or
+                "ImageBvh64IntersectRay")
+            {
+                uint outputIndex = 0;
+                for (uint component = 0; component < 4; component++)
+                {
+                    if ((image.Dmask & (1u << (int)component)) == 0)
+                    {
+                        continue;
+                    }
+
+                    StoreV(image.VectorData + outputIndex++, UInt(0));
+                }
+
+                return true;
+            }
+
             if (!TryResolveDominatingImageBinding(instruction, image, out var bindingIndex))
             {
                 var candidates = _evaluation.ImageBindings
