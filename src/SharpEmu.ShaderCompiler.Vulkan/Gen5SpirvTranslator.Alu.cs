@@ -1101,11 +1101,17 @@ public static partial class Gen5SpirvTranslator
                     condition,
                     SignedClass(0x020, 0x040, zero));
             }
-            else if (opcode is "VCmpFF32" or "VCmpxFF32" or "VCmpFI32" or "VCmpFU32")
+            else if (opcode is
+                     "VCmpFF32" or "VCmpxFF32" or
+                     "VCmpFI32" or "VCmpFU32" or
+                     "VCmpFU64" or "VCmpxFU64")
             {
                 condition = _module.ConstantBool(false);
             }
-            else if (opcode is "VCmpTruF32" or "VCmpxTruF32" or "VCmpTI32" or "VCmpTU32")
+            else if (opcode is
+                     "VCmpTruF32" or "VCmpxTruF32" or
+                     "VCmpTI32" or "VCmpTU32" or
+                     "VCmpTruU64" or "VCmpxTruU64")
             {
                 condition = _module.ConstantBool(true);
             }
@@ -1148,6 +1154,28 @@ public static partial class Gen5SpirvTranslator
                 if (operation == SpirvOp.Nop)
                 {
                     error = $"unsupported float compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+            else if (opcode.EndsWith("U64", StringComparison.Ordinal))
+            {
+                var left = GetRawSource64(instruction, 0);
+                var right = GetRawSource64(instruction, 1);
+                var operation = opcode switch
+                {
+                    "VCmpEqU64" or "VCmpxEqU64" => SpirvOp.IEqual,
+                    "VCmpNeU64" or "VCmpxNeU64" => SpirvOp.INotEqual,
+                    "VCmpLtU64" or "VCmpxLtU64" => SpirvOp.ULessThan,
+                    "VCmpLeU64" or "VCmpxLeU64" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU64" or "VCmpxGtU64" => SpirvOp.UGreaterThan,
+                    "VCmpGeU64" or "VCmpxGeU64" => SpirvOp.UGreaterThanEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported integer compare {opcode}";
                     return false;
                 }
 
@@ -1230,10 +1258,19 @@ public static partial class Gen5SpirvTranslator
             }
             else
             {
-                var compareDestination = instruction.Control is Gen5SdwaControl
-                    { ScalarDestination: { } scalarDestination }
-                    ? scalarDestination
-                    : 106u;
+                uint compareDestination = 106u;
+                if (instruction.Control is Gen5SdwaControl
+                    { ScalarDestination: { } scalarDestination })
+                {
+                    compareDestination = scalarDestination;
+                }
+                else if (instruction.Encoding == Gen5ShaderEncoding.Vop3 &&
+                         instruction.Destinations.Count > 0 &&
+                         instruction.Destinations[0].Kind == Gen5OperandKind.ScalarRegister)
+                {
+                    compareDestination = instruction.Destinations[0].Value;
+                }
+
                 StoreWaveMask(compareDestination, activeCondition);
             }
 

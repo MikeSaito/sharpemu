@@ -1177,6 +1177,23 @@ public static class Gen5ShaderTranslator
             0x372 => "VOr3U32",
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
+            // VOPC u64 compares encoded as VOP3 (GFX10 OP field).
+            0x0E0 => "VCmpFU64",
+            0x0E1 => "VCmpLtU64",
+            0x0E2 => "VCmpEqU64",
+            0x0E3 => "VCmpLeU64",
+            0x0E4 => "VCmpGtU64",
+            0x0E5 => "VCmpNeU64",
+            0x0E6 => "VCmpGeU64",
+            0x0E7 => "VCmpTruU64",
+            0x0F0 => "VCmpxFU64",
+            0x0F1 => "VCmpxLtU64",
+            0x0F2 => "VCmpxEqU64",
+            0x0F3 => "VCmpxLeU64",
+            0x0F4 => "VCmpxGtU64",
+            0x0F5 => "VCmpxNeU64",
+            0x0F6 => "VCmpxGeU64",
+            0x0F7 => "VCmpxTruU64",
             _ => $"Vop3Raw{opcode:X3}",
         };
 
@@ -1880,10 +1897,11 @@ public static class Gen5ShaderTranslator
                     Gen5Operand.Source((extra >> 18) & 0x1FF, literal),
                 ];
                 destinations = [Gen5Operand.Vector(word & 0xFF)];
-                if (opcode == "VReadlaneB32")
+                if (opcode == "VReadlaneB32" ||
+                    opcode.StartsWith("VCmp", StringComparison.Ordinal))
                 {
-                    // The scalar destination lives in the low vdst byte (bits 0-7);
-                    // bits 8-14 are the VOP3B carry-out sdst, which readlane lacks.
+                    // Readlane and VOPC-as-VOP3 store a scalar result in the
+                    // low vdst byte (VCC or an SGPR); VOP3B carry sdst is unused.
                     destinations = [Gen5Operand.Scalar(word & 0xFF)];
                 }
                 var isVop3B = IsVop3BOpcode((word >> 16) & 0x3FF);
