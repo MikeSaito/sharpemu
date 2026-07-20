@@ -1129,6 +1129,8 @@ public static class Gen5ShaderTranslator
             0x10F => "VMinF32",
             0x110 => "VMaxF32",
             0x11F => "VMacF32",
+            0x129 => "VSubbU32",
+            0x12A => "VSubbrevU32",
             0x12B => "VFmacF32",
             0x12F => "VCvtPkrtzF16F32",
             0x141 => "VMadF32",
