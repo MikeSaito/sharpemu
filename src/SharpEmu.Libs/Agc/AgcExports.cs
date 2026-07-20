@@ -9799,6 +9799,24 @@ public static partial class AgcExports
                         .Select(instruction => instruction.Opcode)
                         .Distinct()
                         .Take(48));
+                // Binning dims come from GDS append counters. Always surface the
+                // full GDS op list (not the truncated distinct-opcode preview)
+                // plus M0 so missing producers are obvious in the first-seen dump.
+                var gdsOps = string.Join(
+                    ',',
+                    shaderState.Program.Instructions
+                        .Where(static instruction =>
+                            instruction.Control is Gen5DataShareControl { Gds: true })
+                        .Select(static instruction =>
+                        {
+                            var gds = (Gen5DataShareControl)instruction.Control!;
+                            return $"{instruction.Opcode}@0x{instruction.Pc:X}" +
+                                   $"+{gds.Offset0}/{gds.Offset1}";
+                        }));
+                var m0Probe = evaluation.InitialScalarRegisters.Count > 125
+                    ? $" m0={evaluation.InitialScalarRegisters[124]:X8}" +
+                      $":{evaluation.InitialScalarRegisters[125]:X8}"
+                    : string.Empty;
                 TraceAgcShader(
                     $"agc.compute_shader cs=0x{shaderAddress:X16} " +
                     $"groups={dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ} " +
@@ -9810,6 +9828,8 @@ public static partial class AgcExports
                     $"global_writes={writesGlobalMemory}" +
                     (computeError.Length == 0 ? string.Empty : $" error={computeError}") +
                     $" sgprs=[{scalarProbe}]" +
+                    m0Probe +
+                    (gdsOps.Length == 0 ? string.Empty : $" gds_ops=[{gdsOps}]") +
                     globalBuffers +
                     globalProbes +
                     globalDescriptors +

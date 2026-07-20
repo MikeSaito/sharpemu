@@ -9162,6 +9162,12 @@ internal static unsafe class VulkanVideoPresenter
                     BeginDebugLabel(_commandBuffer, resources.DebugName);
                     if (isFirstBatch)
                     {
+                        if (_seedBinningDepth &&
+                            work.ShaderAddress == 0x0000_0005_009C_4100UL)
+                        {
+                            RecordSeedBinningDepth(resources);
+                        }
+
                         RecordGlobalBufferVisibilityBarrier(
                             _commandBuffer,
                             resources,
@@ -9224,6 +9230,29 @@ internal static unsafe class VulkanVideoPresenter
                     if (isLastBatch)
                     {
                         RecordStorageImagesForRead(resources, PipelineStageFlags.ComputeShaderBit);
+                        if (work.WritesGlobalMemory &&
+                            resources.GlobalMemoryBuffers.Any(
+                                static buffer =>
+                                    buffer.BaseAddress == GdsEmulationBaseAddress))
+                        {
+                            var hostBarrier = new MemoryBarrier
+                            {
+                                SType = StructureType.MemoryBarrier,
+                                SrcAccessMask = AccessFlags.ShaderWriteBit,
+                                DstAccessMask = AccessFlags.HostReadBit,
+                            };
+                            _vk.CmdPipelineBarrier(
+                                _commandBuffer,
+                                PipelineStageFlags.ComputeShaderBit,
+                                PipelineStageFlags.HostBit,
+                                0,
+                                1,
+                                &hostBarrier,
+                                0,
+                                null,
+                                0,
+                                null);
+                        }
                     }
 
                     EndDebugLabel(_commandBuffer);
@@ -9262,6 +9291,7 @@ internal static unsafe class VulkanVideoPresenter
                     // idle unnecessarily serialized presentation work too.
                     WaitForActiveGuestQueueSubmissionsForCpuVisibility();
                     WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
+                    TraceGdsEmulationCounters(work.ShaderAddress);
                 }
                 TraceVulkanShader(
                     $"vk.compute_dispatch groups={work.GroupCountX}x" +
@@ -9269,6 +9299,17 @@ internal static unsafe class VulkanVideoPresenter
                     $"base={work.BaseGroupX}x{work.BaseGroupY}x{work.BaseGroupZ} " +
                     $"textures={work.Textures.Count} cs=0x{work.ShaderAddress:X16} " +
                     $"batches={batchCount}");
+                if (work.WritesGlobalMemory &&
+                    work.GlobalMemoryBuffers.Count > 0)
+                {
+                    var last = work.GlobalMemoryBuffers[^1];
+                    TraceVulkanShader(
+                        $"vk.compute_globals cs=0x{work.ShaderAddress:X16} " +
+                        $"count={work.GlobalMemoryBuffers.Count} " +
+                        $"last=0x{last.BaseAddress:X16}:{last.Length} " +
+                        $"writable={(last.Writable ? 1 : 0)} " +
+                        $"wb={(last.WriteBackToGuest ? 1 : 0)}");
+                }
             }
             catch (Exception exception)
             {
@@ -9515,6 +9556,68 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             allocation.DirtyRanges.Add(new DirtyGuestBufferRange(start, end - start));
+        }
+
+        // Matches AgcExports.GdsEmulationBaseAddress — GDS counters for Astro
+        // binning live in this host-mapped storage buffer.
+        private const ulong GdsEmulationBaseAddress = 0xFFFF_FFFE_0000_0000UL;
+
+        private void TraceGdsEmulationCounters(ulong shaderAddress)
+        {
+            // Emit under the same AGC shader gate as other compute traces so
+            // binning counter dumps show up without a separate VK_RESOURCES flag.
+            if (!_traceVulkanShaderEnabled)
+            {
+                return;
+            }
+
+            foreach (var allocation in _guestBufferAllocations)
+            {
+                if (allocation.BaseAddress != GdsEmulationBaseAddress ||
+                    allocation.Mapped == 0 ||
+                    allocation.Size < sizeof(uint) * 16)
+                {
+                    continue;
+                }
+
+                var words = new uint[16];
+                var mapped = new ReadOnlySpan<byte>(
+                    (void*)allocation.Mapped,
+                    checked((int)Math.Min(allocation.Size, (ulong)int.MaxValue)));
+                MemoryMarshal.Cast<byte, uint>(mapped.Slice(0, words.Length * sizeof(uint)))
+                    .CopyTo(words);
+                var nonzero = 0;
+                var firstNonzero = -1;
+                var dwordCount = mapped.Length / sizeof(uint);
+                var allDwords = MemoryMarshal.Cast<byte, uint>(mapped);
+                for (var index = 0; index < dwordCount; index++)
+                {
+                    if (allDwords[index] == 0)
+                    {
+                        continue;
+                    }
+
+                    nonzero++;
+                    if (firstNonzero < 0)
+                    {
+                        firstNonzero = index;
+                    }
+                }
+
+                var pathProbe = allocation.Size >= sizeof(uint) * 61
+                    ? $" path=[exit={allDwords[56]:X},steps={allDwords[57]}," +
+                      $"maxPc=0x{allDwords[58]:X},append_reach={allDwords[59]}," +
+                      $"append_exec={allDwords[60]}]"
+                    : string.Empty;
+                TraceVulkanShader(
+                    $"vk.gds_counters cs=0x{shaderAddress:X16} " +
+                    $"queue={allocation.QueueName} " +
+                    $"size={allocation.Size} nonzero_dwords={nonzero} " +
+                    $"first_nz={(firstNonzero < 0 ? "-" : firstNonzero.ToString())} " +
+                    $"dwords=[{string.Join(',', words.Select(word => word.ToString("X")))}]" +
+                    pathProbe);
+                return;
+            }
         }
 
         private void WriteBackAllDirtyGuestBuffers(string? queueName = null)
@@ -13645,6 +13748,92 @@ internal static unsafe class VulkanVideoPresenter
             EndDebugLabel(_commandBuffer);
         }
 
+        private void RecordSeedBinningDepth(TranslatedDrawResources resources)
+        {
+            // Proof for the flat-far → cull → no-append chicken/egg: replace
+            // the published R32 depth sampled by CS 0x5009C4100 with a mid
+            // value so binning comparisons can pass. If appends then fire,
+            // the producer was CFG-culled on far depth rather than max-steps.
+            foreach (var texture in resources.Textures)
+            {
+                if (texture.GuestImage is not { } guestImage ||
+                    guestImage.Address != AstroBinningDepthAddress ||
+                    guestImage.Image.Handle == 0)
+                {
+                    continue;
+                }
+
+                var toTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = guestImage.Initialized
+                        ? AccessFlags.ShaderReadBit
+                        : 0,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = guestImage.Initialized
+                        ? ImageLayout.ShaderReadOnlyOptimal
+                        : ImageLayout.Undefined,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = guestImage.Image,
+                    SubresourceRange = ColorSubresourceRange(0, guestImage.MipLevels),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    guestImage.Initialized
+                        ? PipelineStageFlags.AllCommandsBit
+                        : PipelineStageFlags.TopOfPipeBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toTransfer);
+
+                var clearValue = new ClearColorValue(0.5f, 0f, 0f, 0f);
+                var range = ColorSubresourceRange(0, guestImage.MipLevels);
+                _vk.CmdClearColorImage(
+                    _commandBuffer,
+                    guestImage.Image,
+                    ImageLayout.TransferDstOptimal,
+                    &clearValue,
+                    1,
+                    &range);
+
+                var toSampled = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = guestImage.Image,
+                    SubresourceRange = ColorSubresourceRange(0, guestImage.MipLevels),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.ComputeShaderBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toSampled);
+                guestImage.Initialized = true;
+                guestImage.InitialUploadPending = false;
+                TraceVulkanShader(
+                    $"vk.seed_binning_depth addr=0x{guestImage.Address:X16} " +
+                    $"{guestImage.Width}x{guestImage.Height} value=0.5");
+            }
+        }
+
         private void RecordTextureUploads(
             TranslatedDrawResources resources,
             PipelineStageFlags shaderStage)
@@ -14545,6 +14734,9 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_FORCE_TITLE_DISABLE_CULL") == "1";
         private static readonly bool _forceTitleDisableDepth =
             Environment.GetEnvironmentVariable("SHARPEMU_FORCE_TITLE_DISABLE_DEPTH") == "1";
+        private static readonly bool _seedBinningDepth =
+            Environment.GetEnvironmentVariable("SHARPEMU_SEED_BINNING_DEPTH") == "1";
+        private const ulong AstroBinningDepthAddress = 0x0000_0005_12A3_0000UL;
         private static readonly bool _traceTitleState =
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TITLE_STATE") == "1";
         private static readonly bool _forceTitleVertexColorWhite =

@@ -195,6 +195,15 @@ public static partial class Gen5SpirvTranslator
                 ? maxSteps
                 : 100_000;
 
+        // When set, GDS compute shaders write dispatcher diagnostics into high
+        // GDS dwords so a single smoke can distinguish max-steps vs CFG cull
+        // vs never-reaching ds_append (see TraceGdsEmulationCounters).
+        private static readonly bool _gdsPathProbe =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_GDS_PATH_PROBE"),
+                "1",
+                StringComparison.Ordinal);
+
         // Diagnostic coverage probe. When enabled, every selected MRT export
         // writes opaque magenta while preserving the shader's control flow,
         // EXEC mask, geometry and raster state. This separates missing
@@ -264,6 +273,7 @@ public static partial class Gen5SpirvTranslator
         private uint _programCounter;
         private uint _programActive;
         private uint _iterationGuard;
+        private uint _pathProbeMaxPc;
         private uint _globalBuffers;
         private uint _gfx10BufferFormatTable;
         private uint _storageBlockPointer;
@@ -563,6 +573,37 @@ public static partial class Gen5SpirvTranslator
                     loopHeader,
                     loopMerge);
                 _module.AddLabel(loopMerge);
+                if (_gdsPathProbe && _gdsBufferIndex >= 0)
+                {
+                    // High GDS dwords avoid the binning counters at offsets
+                    // 8/16/20/24/28. Layout: [56]=exit, [57]=steps, [58]=maxPc,
+                    // [59]=append-reached, [60]=append-exec.
+                    var steps = _maxDispatcherSteps > 0
+                        ? Load(_uintType, _iterationGuard)
+                        : UInt(0);
+                    var maxed = _maxDispatcherSteps > 0
+                        ? _module.AddInstruction(
+                            SpirvOp.UGreaterThanEqual,
+                            _boolType,
+                            steps,
+                            UInt((uint)_maxDispatcherSteps))
+                        : _module.ConstantBool(false);
+                    var exitCode = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        maxed,
+                        UInt(0x4D4158u), // "MAX\0" le
+                        UInt(0x444F4Eu)); // "NOD\0" / done
+                    Store(BufferWordPointer(_gdsBufferIndex, UInt(56)), exitCode);
+                    Store(BufferWordPointer(_gdsBufferIndex, UInt(57)), steps);
+                    if (_pathProbeMaxPc != 0)
+                    {
+                        Store(
+                            BufferWordPointer(_gdsBufferIndex, UInt(58)),
+                            Load(_uintType, _pathProbeMaxPc));
+                    }
+                }
+
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
@@ -781,6 +822,16 @@ public static partial class Gen5SpirvTranslator
                     _module.Constant(_uintType, 0));
                 _interfaces.Add(_iterationGuard);
                 _module.AddName(_iterationGuard, "pcGuard");
+            }
+
+            if (_gdsPathProbe && _gdsBufferIndex >= 0)
+            {
+                _pathProbeMaxPc = _module.AddGlobalVariable(
+                    _privateUintPointer,
+                    SpirvStorageClass.Private,
+                    _module.Constant(_uintType, 0));
+                _interfaces.Add(_pathProbeMaxPc);
+                _module.AddName(_pathProbeMaxPc, "gdsPathMaxPc");
             }
 
             _interfaces.Add(_scalarRegisters);
@@ -1595,6 +1646,24 @@ public static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             var block = blocks[blockIndex];
+            if (_pathProbeMaxPc != 0)
+            {
+                var previous = Load(_uintType, _pathProbeMaxPc);
+                var greater = _module.AddInstruction(
+                    SpirvOp.UGreaterThan,
+                    _boolType,
+                    UInt(block.StartPc),
+                    previous);
+                Store(
+                    _pathProbeMaxPc,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        greater,
+                        UInt(block.StartPc),
+                        previous));
+            }
+
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
                 var instruction = _state.Program.Instructions[index];
@@ -2033,11 +2102,14 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            // M0 (SGPR 124) holds the GDS base; OFFSET0 is added in bytes.
+            // M0 holds the GDS base; only the low 16 bits address the 64 KiB
+            // GDS heap. Using the full SGPR walks past the emulation buffer, so
+            // ds_append never mutates counters while ordinary stores still work.
             const uint m0Register = 124;
+            var m0Bytes = BitwiseAnd(LoadS(m0Register), UInt(0xFFFF));
             var addressBytes = control.Offset0 == 0
-                ? LoadS(m0Register)
-                : IAdd(LoadS(m0Register), UInt(control.Offset0));
+                ? m0Bytes
+                : IAdd(m0Bytes, UInt(control.Offset0));
             var dwordAddress = ShiftRightLogical(addressBytes, UInt(2));
             var pointer = BufferWordPointer(_gdsBufferIndex, dwordAddress);
             // Device scope + UniformMemory so append counters are visible to
@@ -2056,8 +2128,39 @@ public static partial class Gen5SpirvTranslator
                         return false;
                     }
 
+                    // Path probe: count how often the dispatcher reaches the
+                    // append instruction (independent of EXEC) vs how often the
+                    // EXEC-gated atomic actually runs.
+                    if (_gdsPathProbe)
+                    {
+                        var reachedPointer =
+                            BufferWordPointer(_gdsBufferIndex, UInt(59));
+                        _ = EmitAtomic(
+                            SpirvOp.AtomicIAdd,
+                            _uintType,
+                            reachedPointer,
+                            deviceScope,
+                            uniformAcquireRelease,
+                            value: () => UInt(1),
+                            comparator: () => UInt(0));
+                    }
+
                     EmitExecConditional(() =>
                     {
+                        if (_gdsPathProbe)
+                        {
+                            var execPointer =
+                                BufferWordPointer(_gdsBufferIndex, UInt(60));
+                            _ = EmitAtomic(
+                                SpirvOp.AtomicIAdd,
+                                _uintType,
+                                execPointer,
+                                deviceScope,
+                                uniformAcquireRelease,
+                                value: () => UInt(1),
+                                comparator: () => UInt(0));
+                        }
+
                         var previous = EmitAtomic(
                             SpirvOp.AtomicIAdd,
                             _uintType,
