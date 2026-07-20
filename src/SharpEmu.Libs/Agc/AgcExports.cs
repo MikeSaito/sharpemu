@@ -581,7 +581,9 @@ public static partial class AgcExports
         public uint DefaultOwner { get; set; } = DefaultAgcOwner;
         public uint NextOwner { get; set; } = 1;
         public uint NextResource { get; set; } = 1;
-        public ulong WorkSequence { get; set; }
+        // Incremented with Interlocked so graphics/compute can parse in parallel
+        // after Submit releases Gate during ParseSubmittedDcb.
+        public long WorkSequence;
         public ulong SubmissionSequence { get; set; }
         public bool WaitMonitorRunning { get; set; }
     }
@@ -605,6 +607,14 @@ public static partial class AgcExports
         public required string QueueName;
         public required string DebugName;
         public bool Completed;
+        /// <summary>
+        /// True while the release_mem packet exists only in a built CB that has
+        /// not reached ApplySubmittedReleaseMem yet. Blocks orphan force until
+        /// submit promotes it or <see cref="RegisteredTicks"/> ages past the
+        /// pending-stuck grace.
+        /// </summary>
+        public bool Pending;
+        public long RegisteredTicks;
     }
 
     private readonly record struct RegisterDefaultValue(uint Offset, uint Value);
@@ -1474,6 +1484,26 @@ public static partial class AgcExports
         TraceAgc(
             $"agc.cb_release_mem buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
             $"action=0x{action:X2} gcr=0x{gcrControl:X4} dst=0x{destinationAddress:X16} data_sel={dataSelection} data=0x{data:X16}");
+
+        // Astro builds release_mem into graphics CBs before DriverSubmit. Register
+        // a pending producer so orphan does not force-satisfy ACB waits while the
+        // producer CB is still only built (Gate-free parse can then submit it).
+        var pendingLength = dataSelection switch
+        {
+            1 => (ulong)sizeof(uint),
+            2 or 3 => (ulong)sizeof(ulong),
+            _ => 0UL,
+        };
+        if (pendingLength != 0 && destinationAddress != 0)
+        {
+            RegisterPendingLabelProducer(
+                ctx.Memory,
+                destinationAddress,
+                pendingLength,
+                commandAddress,
+                commandBufferAddress);
+        }
+
         return ReturnPointer(ctx, commandAddress);
     }
 
@@ -2823,19 +2853,24 @@ public static partial class AgcExports
 
         VulkanVideoPresenter.AttachGuestMemory(ctx.Memory);
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        SubmittedDcbState graphics;
+        ulong submissionId;
         lock (gpuState.Gate)
         {
-            gpuState.Graphics.QueueName = "dcb.graphics";
-            EnqueueSubmittedDcb(
-                ctx,
-                gpuState,
-                gpuState.Graphics,
+            graphics = gpuState.Graphics;
+            graphics.QueueName = "dcb.graphics";
+            submissionId = ++gpuState.SubmissionSequence;
+            graphics.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
                 commandAddress,
                 dwordCount,
-                ++gpuState.SubmissionSequence,
-                tracePackets);
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+                submissionId,
+                tracePackets));
         }
+
+        // Parse outside Gate so another guest thread can SubmitAcb/Dcb while
+        // this queue is suspended on WAIT_REG_MEM (Astro cross-queue fences).
+        PumpSubmittedQueue(ctx, gpuState, graphics);
+        DrainResumableDcbs(ctx, gpuState, tracePackets);
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2875,25 +2910,25 @@ public static partial class AgcExports
 
         VulkanVideoPresenter.AttachGuestMemory(ctx.Memory);
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        SubmittedDcbState queueState;
         lock (gpuState.Gate)
         {
-            if (!gpuState.ComputeQueues.TryGetValue(ownerHandle, out var queueState))
+            if (!gpuState.ComputeQueues.TryGetValue(ownerHandle, out queueState!))
             {
                 queueState = new SubmittedDcbState();
                 gpuState.ComputeQueues.Add(ownerHandle, queueState);
             }
 
             queueState.QueueName = $"acb.compute[{ownerHandle}]";
-            EnqueueSubmittedDcb(
-                ctx,
-                gpuState,
-                queueState,
+            queueState.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
                 commandAddress,
                 dwordCount,
                 ++gpuState.SubmissionSequence,
-                tracePackets);
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+                tracePackets));
         }
+
+        PumpSubmittedQueue(ctx, gpuState, queueState);
+        DrainResumableDcbs(ctx, gpuState, tracePackets);
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -3029,43 +3064,67 @@ public static partial class AgcExports
         ulong submissionId,
         bool tracePackets)
     {
-        state.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
-            commandAddress,
-            dwordCount,
-            submissionId,
-            tracePackets));
+        lock (gpuState.Gate)
+        {
+            state.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
+                commandAddress,
+                dwordCount,
+                submissionId,
+                tracePackets));
+        }
+
         PumpSubmittedQueue(ctx, gpuState, state);
     }
 
+    /// <summary>
+    /// Drains pending submissions for one hardware queue. Gate is held only
+    /// around queue bookkeeping: ParseSubmittedDcb runs unlocked so a guest
+    /// thread can submit the producer DCB while another queue is suspended on
+    /// WAIT_REG_MEM (Astro ACB↔mesh label handshake).
+    /// </summary>
     private static void PumpSubmittedQueue(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         SubmittedDcbState state)
     {
-        if (state.IsSuspended)
+        while (true)
         {
-            return;
-        }
+            SubmittedDcbState.PendingSubmission submission;
+            lock (gpuState.Gate)
+            {
+                if (state.IsSuspended || state.HasActiveSubmission)
+                {
+                    return;
+                }
 
-        while (!state.HasActiveSubmission &&
-               state.PendingSubmissions.TryDequeue(out var submission))
-        {
-            state.HasActiveSubmission = true;
-            state.ActiveSubmissionId = submission.SubmissionId;
-            state.IsSuspended = ParseSubmittedDcb(
+                if (!state.PendingSubmissions.TryDequeue(out submission))
+                {
+                    return;
+                }
+
+                state.HasActiveSubmission = true;
+                state.ActiveSubmissionId = submission.SubmissionId;
+            }
+
+            var suspended = ParseSubmittedDcb(
                 ctx,
                 gpuState,
                 state,
                 submission.CommandAddress,
                 submission.DwordCount,
                 submission.TracePackets);
-            if (state.IsSuspended)
-            {
-                return;
-            }
 
-            state.HasActiveSubmission = false;
-            NotifySubmittedDcbCompleted(gpuState, state, submission.SubmissionId);
+            lock (gpuState.Gate)
+            {
+                if (suspended)
+                {
+                    state.IsSuspended = true;
+                    return;
+                }
+
+                state.HasActiveSubmission = false;
+                NotifySubmittedDcbCompleted(gpuState, state, submission.SubmissionId);
+            }
         }
     }
 
@@ -3833,13 +3892,11 @@ public static partial class AgcExports
                 static state =>
                 {
                     var (resumeContext, resumeGpuState) = state;
-                    lock (resumeGpuState.Gate)
-                    {
-                        DrainResumableDcbs(
-                            resumeContext,
-                            resumeGpuState,
-                            tracePackets: _traceAgc);
-                    }
+                    // Do not hold Gate across resume/parse — SubmitDcb needs it.
+                    DrainResumableDcbs(
+                        resumeContext,
+                        resumeGpuState,
+                        tracePackets: _traceAgc);
                 },
                 (ctx, gpuState),
                 preferLocal: false);
@@ -3901,6 +3958,10 @@ public static partial class AgcExports
             return null;
         }
 
+        // Promote: the matching cb_release_mem pending entry is done once the
+        // submitted packet is queued for ordered write.
+        CompletePendingLabelProducers(memory, packetAddress, address, length);
+
         var producer = new LabelProducerTrace
         {
             Sequence = Interlocked.Increment(ref _labelProducerSequence),
@@ -3911,6 +3972,8 @@ public static partial class AgcExports
             SubmissionId = state.ActiveSubmissionId,
             QueueName = state.QueueName,
             DebugName = debugName,
+            Pending = false,
+            RegisteredTicks = System.Diagnostics.Stopwatch.GetTimestamp(),
         };
         lock (_labelProducerGate)
         {
@@ -3935,6 +3998,105 @@ public static partial class AgcExports
         }
 
         return producer;
+    }
+
+    /// <summary>
+    /// Records that a release_mem packet targeting <paramref name="address"/> was
+    /// emitted into a command buffer that has not been submitted yet.
+    /// </summary>
+    private static void RegisterPendingLabelProducer(
+        object memory,
+        ulong address,
+        ulong length,
+        ulong packetAddress,
+        ulong commandBufferAddress)
+    {
+        if (address == 0 || length == 0 || packetAddress == 0)
+        {
+            return;
+        }
+
+        var producer = new LabelProducerTrace
+        {
+            Sequence = Interlocked.Increment(ref _labelProducerSequence),
+            Memory = memory,
+            Address = address,
+            Length = length,
+            PacketAddress = packetAddress,
+            SubmissionId = 0,
+            QueueName = "cb-pending",
+            DebugName =
+                $"pending_release_mem dst=0x{address:X16} buf=0x{commandBufferAddress:X16}",
+            Pending = true,
+            RegisteredTicks = System.Diagnostics.Stopwatch.GetTimestamp(),
+        };
+        lock (_labelProducerGate)
+        {
+            // Replace an older pending for the same packet (CB rebuild).
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var existing = _labelProducers[index];
+                if (existing.Pending &&
+                    ReferenceEquals(existing.Memory, memory) &&
+                    existing.PacketAddress == packetAddress)
+                {
+                    existing.Completed = true;
+                }
+            }
+
+            if (_labelProducers.Count >= 4096)
+            {
+                _labelProducers.RemoveRange(0, 1024);
+            }
+
+            _labelProducers.Add(producer);
+        }
+
+        TraceAgc(
+            $"agc.label_producer_pending label=0x{address:X16} " +
+            $"packet=0x{packetAddress:X16} buf=0x{commandBufferAddress:X16} " +
+            $"producer_seq={producer.Sequence} len={length}");
+
+        if (_traceAgc)
+        {
+            foreach (var waiting in GpuWaitRegistry.SnapshotInRange(memory, address, length))
+            {
+                TraceAgc(
+                    $"agc.wait_producer_scheduled label=0x{waiting.Address:X16} " +
+                    $"waiters={waiting.Count} producer_seq={producer.Sequence} " +
+                    $"queue={producer.QueueName} submission=0 " +
+                    $"packet=0x{packetAddress:X16} action='{producer.DebugName}'");
+            }
+        }
+    }
+
+    private static void CompletePendingLabelProducers(
+        object memory,
+        ulong packetAddress,
+        ulong address,
+        ulong length)
+    {
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var producer = _labelProducers[index];
+                if (!producer.Pending ||
+                    producer.Completed ||
+                    !ReferenceEquals(producer.Memory, memory))
+                {
+                    continue;
+                }
+
+                var packetMatch = packetAddress != 0 && producer.PacketAddress == packetAddress;
+                var rangeMatch = RangesOverlap(producer.Address, producer.Length, address, length);
+                if (packetMatch || rangeMatch)
+                {
+                    producer.Completed = true;
+                    producer.Pending = false;
+                }
+            }
+        }
     }
 
     private static void CompleteLabelProducer(LabelProducerTrace? producer)
@@ -3979,12 +4141,19 @@ public static partial class AgcExports
             for (var index = _labelProducers.Count - 1; index >= 0; index--)
             {
                 var candidate = _labelProducers[index];
-                if (!ReferenceEquals(candidate.Memory, memory) ||
+                if (candidate.Completed ||
                     !RangesOverlap(
                         candidate.Address,
                         candidate.Length,
                         waiter.WaitAddress,
                         waiter.Is64Bit ? (ulong)sizeof(ulong) : sizeof(uint)))
+                {
+                    continue;
+                }
+
+                // Pending: match by label address (build-time memory may differ).
+                // In-flight: require same memory instance.
+                if (!candidate.Pending && !ReferenceEquals(candidate.Memory, memory))
                 {
                     continue;
                 }
@@ -4034,12 +4203,26 @@ public static partial class AgcExports
             return;
         }
 
+        var producerState = producer.Pending
+            ? "pending"
+            : producer.Completed
+                ? "completed"
+                : "queued";
+        if (producer.Pending && !stale)
+        {
+            // Wait arrived after cb_release_mem built the producer packet.
+            TraceAgc(
+                $"agc.wait_producer_scheduled label=0x{waiter.WaitAddress:X16} " +
+                $"waiters=1 producer_seq={producer.Sequence} " +
+                $"queue={producer.QueueName} submission={producer.SubmissionId} " +
+                $"packet=0x{producer.PacketAddress:X16} action='{producer.DebugName}'");
+        }
+
         TraceAgc(
             $"{prefix} label=0x{waiter.WaitAddress:X16} " +
             $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
             condition + " " +
-            $"producer_seq={producer.Sequence} producer_state=" +
-            $"{(producer.Completed ? "completed" : "queued")} " +
+            $"producer_seq={producer.Sequence} producer_state={producerState} " +
             $"producer_queue={producer.QueueName} " +
             $"producer_submission={producer.SubmissionId} " +
             $"producer_packet=0x{producer.PacketAddress:X16} " +
@@ -4752,6 +4935,18 @@ public static partial class AgcExports
             ? orphanMs
             : 50L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
 
+    // Built-but-unsubmitted cb_release_mem packets register pending producers.
+    // Orphan must not force those labels until the wait itself ages past this
+    // grace without a matching DriverSubmit (CB truly stuck). Default 60s —
+    // Astro submits producer DCBs ~9–15s after the ACB wait under Gate-free
+    // parse; 8s was too short. Override with SHARPEMU_GPU_WAIT_PENDING_STUCK_MS.
+    private static readonly long _gpuWaitPendingStuckTicks =
+        (long.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_PENDING_STUCK_MS"),
+             out var pendingStuckMs) && pendingStuckMs >= 0
+            ? pendingStuckMs
+            : 60000L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+
     private static int _orphanWaitForceCount;
 
     // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
@@ -4961,12 +5156,16 @@ public static partial class AgcExports
         CpuContext submitContext,
         SubmittedGpuState gpuState)
     {
-        if (gpuState.WaitMonitorRunning)
+        lock (gpuState.Gate)
         {
-            return;
+            if (gpuState.WaitMonitorRunning)
+            {
+                return;
+            }
+
+            gpuState.WaitMonitorRunning = true;
         }
 
-        gpuState.WaitMonitorRunning = true;
         var monitorContext = new CpuContext(
             submitContext.Memory,
             submitContext.TargetGeneration);
@@ -4984,25 +5183,34 @@ public static partial class AgcExports
         while (true)
         {
             var madeProgress = false;
+            var before = 0;
+            var after = 0;
             lock (gpuState.Gate)
             {
-                var before = GpuWaitRegistry.CountForMemory(ctx.Memory);
+                before = GpuWaitRegistry.CountForMemory(ctx.Memory);
                 if (before == 0)
                 {
                     gpuState.WaitMonitorRunning = false;
                     return;
                 }
 
-                var orphanForced = TryForceSatisfyOrphanGpuWaits(ctx);
-                DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
-                var after = GpuWaitRegistry.CountForMemory(ctx.Memory);
-                madeProgress = orphanForced > 0 || after < before;
+                _ = TryForceSatisfyOrphanGpuWaits(ctx);
+            }
+
+            // Resume/parse must not hold Gate — producer SubmitDcb needs it.
+            DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
+
+            lock (gpuState.Gate)
+            {
+                after = GpuWaitRegistry.CountForMemory(ctx.Memory);
+                madeProgress = after < before;
                 if (madeProgress)
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] agc.wait_monitor_resumed count={before - after} " +
                         $"remaining={after}");
                 }
+
                 if (after == 0)
                 {
                     gpuState.WaitMonitorRunning = false;
@@ -5028,9 +5236,47 @@ public static partial class AgcExports
                 var producer = _labelProducers[index];
                 // Completed producers no longer keep orphan waits alive; only
                 // in-flight / cb-build placeholders block force-satisfy.
-                if (!ReferenceEquals(producer.Memory, memory) ||
-                    producer.Length == 0 ||
-                    producer.Completed)
+                if (producer.Length == 0 || producer.Completed)
+                {
+                    continue;
+                }
+
+                // Pending entries are recorded during CB build, possibly before
+                // guest memory identity settles. Match them by label address.
+                // In-flight producers still require the same memory instance.
+                if (!producer.Pending && !ReferenceEquals(producer.Memory, memory))
+                {
+                    continue;
+                }
+
+                var producerEnd = producer.Address > ulong.MaxValue - producer.Length
+                    ? ulong.MaxValue
+                    : producer.Address + producer.Length;
+                if (producer.Address >= waitEnd || address >= producerEnd)
+                {
+                    continue;
+                }
+
+                // Pending always counts here; stuck grace is applied against the
+                // waiter's age in TryForceSatisfyOrphanGpuWaits (build-time age
+                // is useless — CBs are emitted long before DriverSubmit).
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsPendingLabelProducer(object memory, ulong address, bool is64Bit)
+    {
+        var width = (ulong)(is64Bit ? sizeof(ulong) : sizeof(uint));
+        var waitEnd = address > ulong.MaxValue - width ? ulong.MaxValue : address + width;
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var producer = _labelProducers[index];
+                if (!producer.Pending || producer.Completed || producer.Length == 0)
                 {
                     continue;
                 }
@@ -5070,7 +5316,23 @@ public static partial class AgcExports
         {
             if (HasRegisteredLabelProducer(ctx.Memory, waiter.WaitAddress, waiter.Is64Bit))
             {
-                continue;
+                // Built-but-unsubmitted release_mem: keep waiting until the CB is
+                // submitted, or until THIS wait (not the build timestamp) exceeds
+                // the pending-stuck grace.
+                if (IsPendingLabelProducer(ctx.Memory, waiter.WaitAddress, waiter.Is64Bit) &&
+                    _gpuWaitPendingStuckTicks > 0 &&
+                    now - waiter.RegisteredTicks < _gpuWaitPendingStuckTicks)
+                {
+                    continue;
+                }
+
+                if (!IsPendingLabelProducer(ctx.Memory, waiter.WaitAddress, waiter.Is64Bit))
+                {
+                    // In-flight ordered producer — never orphan.
+                    continue;
+                }
+
+                // Pending past stuck grace: fall through and force.
             }
 
             ulong currentValue = 0;
@@ -5162,6 +5424,9 @@ public static partial class AgcExports
     // guest memory (labels are advanced by ReleaseMem/WriteData/DmaData packets
     // or direct CPU writes) and resumes the ones now satisfied. A resumed DCB
     // can itself write labels that unblock others, so loop to a fixed point.
+    //
+    // Must not be called while holding gpuState.Gate across ParseSubmittedDcb:
+    // producer queues need that lock to submit.
     private static void DrainResumableDcbs(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -5174,44 +5439,48 @@ public static partial class AgcExports
 
         for (var pass = 0; pass < 256; pass++)
         {
-            var woken = GpuWaitRegistry.CollectSatisfied(ctx.Memory, (address, is64Bit) =>
-                is64Bit
-                    ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
-                    : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
-
-            if (woken is null)
+            List<GpuWaitRegistry.WaitingDcb>? woken;
+            lock (gpuState.Gate)
             {
-                if (TryForceSatisfyOrphanGpuWaits(ctx) > 0)
-                {
-                    continue;
-                }
+                woken = GpuWaitRegistry.CollectSatisfied(ctx.Memory, (address, is64Bit) =>
+                    is64Bit
+                        ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
+                        : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
 
-                if (_gpuWaitStaleTicks > 0 &&
-                    GpuWaitRegistry.CollectUnreportedStale(
-                        ctx.Memory,
-                        System.Diagnostics.Stopwatch.GetTimestamp(),
-                        _gpuWaitStaleTicks) is { } stale)
+                if (woken is null)
                 {
-                    foreach (var waiter in stale)
+                    if (TryForceSatisfyOrphanGpuWaits(ctx) > 0)
                     {
-                        ulong? currentValue = waiter.Is64Bit
-                            ? TryReadUInt64(ctx, waiter.WaitAddress, out var value64)
-                                ? value64
-                                : null
-                            : TryReadUInt32(ctx, waiter.WaitAddress, out var value32)
-                                ? value32
-                                : null;
-                        TraceWaitProducerState(
-                            ctx.Memory,
-                            waiter,
-                            waiter.CommandBufferAddress,
-                            waiter.ResumeAddress,
-                            stale: true,
-                            currentValue);
+                        continue;
                     }
-                }
 
-                return;
+                    if (_gpuWaitStaleTicks > 0 &&
+                        GpuWaitRegistry.CollectUnreportedStale(
+                            ctx.Memory,
+                            System.Diagnostics.Stopwatch.GetTimestamp(),
+                            _gpuWaitStaleTicks) is { } stale)
+                    {
+                        foreach (var waiter in stale)
+                        {
+                            ulong? currentValue = waiter.Is64Bit
+                                ? TryReadUInt64(ctx, waiter.WaitAddress, out var value64)
+                                    ? value64
+                                    : null
+                                : TryReadUInt32(ctx, waiter.WaitAddress, out var value32)
+                                    ? value32
+                                    : null;
+                            TraceWaitProducerState(
+                                ctx.Memory,
+                                waiter,
+                                waiter.CommandBufferAddress,
+                                waiter.ResumeAddress,
+                                stale: true,
+                                currentValue);
+                        }
+                    }
+
+                    return;
+                }
             }
 
             foreach (var waiter in woken)
@@ -5240,9 +5509,13 @@ public static partial class AgcExports
             $"waited_ms={waitedMilliseconds:F3}");
         if (remainingDwords == 0)
         {
-            state.IsSuspended = false;
-            state.HasActiveSubmission = false;
-            NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+            lock (gpuState.Gate)
+            {
+                state.IsSuspended = false;
+                state.HasActiveSubmission = false;
+                NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+            }
+
             PumpSubmittedQueue(ctx, gpuState, state);
             return;
         }
@@ -5254,25 +5527,35 @@ public static partial class AgcExports
                 $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced=False");
         }
 
-        System.Diagnostics.Debug.Assert(state.HasActiveSubmission);
-        System.Diagnostics.Debug.Assert(state.IsSuspended);
-        state.QueueName = waiter.QueueName ?? state.QueueName;
-        state.ActiveSubmissionId = waiter.SubmissionId;
-        state.IsSuspended = false;
-        if (ParseSubmittedDcb(
-                ctx,
-                gpuState,
-                state,
-                waiter.ResumeAddress,
-                remainingDwords,
-                tracePackets))
+        lock (gpuState.Gate)
         {
-            state.IsSuspended = true;
-            return;
+            System.Diagnostics.Debug.Assert(state.HasActiveSubmission);
+            System.Diagnostics.Debug.Assert(state.IsSuspended);
+            state.QueueName = waiter.QueueName ?? state.QueueName;
+            state.ActiveSubmissionId = waiter.SubmissionId;
+            state.IsSuspended = false;
         }
 
-        state.HasActiveSubmission = false;
-        NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+        var suspended = ParseSubmittedDcb(
+            ctx,
+            gpuState,
+            state,
+            waiter.ResumeAddress,
+            remainingDwords,
+            tracePackets);
+
+        lock (gpuState.Gate)
+        {
+            if (suspended)
+            {
+                state.IsSuspended = true;
+                return;
+            }
+
+            state.HasActiveSubmission = false;
+            NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+        }
+
         PumpSubmittedQueue(ctx, gpuState, state);
     }
 
@@ -5580,7 +5863,7 @@ public static partial class AgcExports
         var hasPsInputAddr = state.CxRegisters.TryGetValue(SpiPsInputAddr, out var psInputAddr);
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var renderTargets = GetRenderTargets(state.CxRegisters);
-        var drawSequence = ++gpuState.WorkSequence;
+        var drawSequence = (ulong)Interlocked.Increment(ref gpuState.WorkSequence);
         if (state.PendingTargetlessDraw is { } stalePendingDraw)
         {
             ReturnPooledDrawArrays(
@@ -7791,7 +8074,11 @@ public static partial class AgcExports
                 }
 
                 state.RenderTargetWriters.TryGetValue(texture.Address, out var sourceWriter);
-                gpuState.ComputeImageWriters.TryGetValue(texture.Address, out var computeWriter);
+                ComputeImageWriter computeWriter;
+                lock (gpuState.Gate)
+                {
+                    gpuState.ComputeImageWriters.TryGetValue(texture.Address, out computeWriter);
+                }
                 var writer = sourceWriter.Sequence >= computeWriter.Sequence && sourceWriter.Sequence != 0
                     ? $"/writer={sourceWriter.Sequence}:" +
                       $"es0x{sourceWriter.ExportShaderAddress:X}:" +
@@ -9191,7 +9478,7 @@ public static partial class AgcExports
             return;
         }
 
-        var sequence = ++gpuState.WorkSequence;
+        var sequence = (ulong)Interlocked.Increment(ref gpuState.WorkSequence);
         ulong shaderHeader;
         lock (_submitTraceGate)
         {
@@ -9255,10 +9542,13 @@ public static partial class AgcExports
                 $"{descriptorState}/{ProbeTexture(ctx, texture)}");
             if (isStorage && descriptorValid && texture.Address != 0)
             {
-                gpuState.ComputeImageWriters[texture.Address] = new ComputeImageWriter(
-                    sequence,
-                    shaderAddress,
-                    binding.Opcode);
+                lock (gpuState.Gate)
+                {
+                    gpuState.ComputeImageWriters[texture.Address] = new ComputeImageWriter(
+                        sequence,
+                        shaderAddress,
+                        binding.Opcode);
+                }
 
                 TraceAgcShader(
                     $"agc.compute_writer addr=0x{texture.Address:X16} " +
@@ -12124,37 +12414,45 @@ public static partial class AgcExports
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal);
 
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
-        lock (gpuState.Gate)
+        Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
+        try
         {
-            Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
-            try
+            for (uint i = 0; i < bufferCount; i++)
             {
-                for (uint i = 0; i < bufferCount; i++)
+                if (!ctx.TryReadUInt64(addressArray + i * 8, out var commandAddress) ||
+                    commandAddress == 0 ||
+                    !ctx.TryReadUInt32(sizeArray + i * 4, out var dwordCount) ||
+                    dwordCount == 0)
                 {
-                    if (!ctx.TryReadUInt64(addressArray + i * 8, out var commandAddress) ||
-                        commandAddress == 0 ||
-                        !ctx.TryReadUInt32(sizeArray + i * 4, out var dwordCount) ||
-                        dwordCount == 0)
-                    {
-                        continue;
-                    }
-
-                    if (tracePackets)
-                    {
-                        TraceAgc(
-                            $"agc.driver_submit_multi_dcbs index={i}/{bufferCount} " +
-                            $"addr=0x{commandAddress:X16} dwords={dwordCount}");
-                    }
-
-                    ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                    continue;
                 }
 
-                DrainResumableDcbs(ctx, gpuState, tracePackets);
+                if (tracePackets)
+                {
+                    TraceAgc(
+                        $"agc.driver_submit_multi_dcbs index={i}/{bufferCount} " +
+                        $"addr=0x{commandAddress:X16} dwords={dwordCount}");
+                }
+
+                lock (gpuState.Gate)
+                {
+                    gpuState.Graphics.QueueName = "dcb.graphics";
+                    gpuState.Graphics.PendingSubmissions.Enqueue(
+                        new SubmittedDcbState.PendingSubmission(
+                            commandAddress,
+                            dwordCount,
+                            ++gpuState.SubmissionSequence,
+                            tracePackets));
+                }
+
+                PumpSubmittedQueue(ctx, gpuState, gpuState.Graphics);
             }
-            finally
-            {
-                Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
-            }
+
+            DrainResumableDcbs(ctx, gpuState, tracePackets);
+        }
+        finally
+        {
+            Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
         }
 
         ctx[CpuRegister.Rax] = 0;
