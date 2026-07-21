@@ -9993,10 +9993,19 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            var targetFormats = new VulkanRenderTargetFormat[work.Targets.Count];
+            var resolvedTargets = new GuestRenderTarget[work.Targets.Count];
+            for (var index = 0; index < resolvedTargets.Length; index++)
+            {
+                resolvedTargets[index] = work.Targets[index].Address == 0 &&
+                    work.DepthTarget is { } depthOnlyTarget
+                        ? GetDepthOnlyColorTarget(depthOnlyTarget)
+                        : work.Targets[index];
+            }
+
+            var targetFormats = new VulkanRenderTargetFormat[resolvedTargets.Length];
             for (var index = 0; index < targetFormats.Length; index++)
             {
-                var target = work.Targets[index];
+                var target = resolvedTargets[index];
                 if (!TryDecodeRenderTargetFormat(target.Format, target.NumberType, out targetFormats[index]) ||
                     !SupportsColorAttachment(targetFormats[index].Format))
                 {
@@ -10057,7 +10066,7 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
-                foreach (var target in work.Targets)
+                foreach (var target in resolvedTargets)
                 {
                     if (target.Address != 0 && target.Address == texture.Address)
                     {
@@ -10076,20 +10085,17 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan skipped storage render-target feedback loop " +
-                    $"targets={string.Join(',', work.Targets.Where(target => target.Address != 0).Select(target => $"0x{target.Address:X16}"))}; " +
+                    $"targets={string.Join(',', resolvedTargets.Where(target => target.Address != 0).Select(target => $"0x{target.Address:X16}"))}; " +
                     "sampled aliases use ordered snapshots");
                 ReturnPooledGuestData(work.Draw);
                 return;
             }
 
-            var targets = new GuestImageResource[work.Targets.Count];
+            var targets = new GuestImageResource[resolvedTargets.Length];
             EnsureGuestSubmissionCapacity();
             for (var index = 0; index < targets.Length; index++)
             {
-                var targetDescriptor = work.Targets[index].Address == 0 &&
-                    work.DepthTarget is { } depthOnlyTarget
-                        ? GetDepthOnlyColorTarget(depthOnlyTarget)
-                        : work.Targets[index];
+                var targetDescriptor = resolvedTargets[index];
                 targets[index] = GetOrCreateGuestImage(targetDescriptor, formats[index]);
                 if (work.Targets[index].Address != 0 &&
                     TakeGuestImageInitialData(work.Targets[index].Address) is { } initialData &&
@@ -10185,19 +10191,21 @@ internal static unsafe class VulkanVideoPresenter
                     }
                 }
 
+                // When ClearEnable is set alone, the draw's interpolated Z is
+                // not the guest clear value — strip write so color draws that
+                // also clear DB do not overwrite the clear.
+                var preserveDepthWriteAfterClear =
+                    clearDepthForDraw && draw.RenderState.Depth.WriteEnable;
                 if (clearDepthForDraw)
                 {
-                    // DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE makes this a DB
-                    // clear operation. The draw still produces color, but its
-                    // interpolated vertex Z is not the guest clear value.
                     draw = draw with
                     {
                         RenderState = draw.RenderState with
                         {
                             Depth = draw.RenderState.Depth with
                             {
-                                TestEnable = false,
-                                WriteEnable = false,
+                                TestEnable = preserveDepthWriteAfterClear,
+                                WriteEnable = preserveDepthWriteAfterClear,
                                 ClearEnable = false,
                             },
                         },
@@ -10418,19 +10426,20 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     depth.Initialized = true;
                     depth.Layout = ImageLayout.DepthStencilAttachmentOptimal;
-                    if (clearDepthForDraw)
+                    if (preserveDepthWriteAfterClear ||
+                        draw.RenderState.Depth.WriteEnable)
+                    {
+                        depth.InitializationSource = "translated-depth-write";
+                        // Astro lighting ImageLoads DB memory as R32 storage at
+                        // the same VA. Publish a color twin so those loads see
+                        // the depth prepass instead of an empty R32 allocation.
+                        PublishDepthBufferAsR32(depth);
+                    }
+                    else if (clearDepthForDraw)
                     {
                         depth.InitializationSource = "guest-depth-clear";
                         // Astro lighting ImageLoads DB memory as R32 at the same
                         // VA. Publish after a DB clear so fmt4/num7 loads see it.
-                        PublishDepthBufferAsR32(depth);
-                    }
-                    else if (draw.RenderState.Depth.WriteEnable)
-                    {
-                        depth.InitializationSource = "translated-depth-write";
-                        // Astro lighting ImageLoads DB memory as R32 storage at the
-                        // same VA. Publish a color twin so those loads see the
-                        // depth prepass instead of an empty R32 allocation.
                         PublishDepthBufferAsR32(depth);
                     }
                 }

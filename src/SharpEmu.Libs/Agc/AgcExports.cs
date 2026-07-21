@@ -6154,11 +6154,20 @@ public static partial class AgcExports
                              !renderState.Depth.TestEnable &&
                              !renderState.Depth.ClearEnable)
                     {
-                        // Targetless depth prepass with a writable DB base but
-                        // odd/cleared Z flags (Astro seq=20: CONTROL=0x70).
-                        // Forcing Z-write of vertex depth produced an all-zero
-                        // DB (near plane); treat it as a DB clear to the guest
-                        // clear value so later ImageLoads see non-empty R32.
+                        // Targetless depth prepass (Astro seq=20: CONTROL=0x70).
+                        // Guest leaves Z_ENABLE/Z_WRITE clear; ES is a clip-space
+                        // fullscreen triangle (Z=0) and PS only NULL-exports
+                        // (target 9), so this pass cannot write geometry depth.
+                        // Clear+publish the DB so later ImageLoads see a stable
+                        // R32. For the Astro binning surface, guest far (1.0)
+                        // EXEC-culls CS 0x5009C4100; use a mid clear so appends
+                        // can run until a real depth producer exists.
+                        var clearDepth = translatedDepthTarget.ClearDepth;
+                        if (translatedDepthTarget.Address == 0x0000_0005_12A3_0000UL)
+                        {
+                            clearDepth = 0.5f;
+                        }
+
                         renderState = renderState with
                         {
                             Depth = new GuestDepthState(
@@ -6169,12 +6178,17 @@ public static partial class AgcExports
                                     : 7u,
                                 ClearEnable: true),
                         };
+                        translatedDepthTarget = translatedDepthTarget with
+                        {
+                            ClearDepth = clearDepth,
+                        };
                         TraceAgcShader(
                             $"agc.targetless_depth_prepass seq={drawSequence} " +
                             $"depth=0x{translatedDepthTarget.Address:X16}:" +
                             $"{translatedDepthTarget.Width}x{translatedDepthTarget.Height}:" +
                             $"fmt{translatedDepthTarget.GuestFormat}/sw{translatedDepthTarget.SwizzleMode} " +
-                            $"es=0x{exportShaderAddress:X16} ps=0x{pixelShaderAddress:X16}");
+                            $"es=0x{exportShaderAddress:X16} ps=0x{pixelShaderAddress:X16} " +
+                            $"zwrite=0 clear={clearDepth:0.###}");
                     }
 
                     TraceDrawCompact(

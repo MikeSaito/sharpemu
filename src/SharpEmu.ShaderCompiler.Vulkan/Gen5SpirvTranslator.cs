@@ -4679,6 +4679,18 @@ public static partial class Gen5SpirvTranslator
                     : Float(component == 3 ? 1f : 0f);
             }
 
+            if (export.Target == 12 &&
+                _state.Program.Address == 0x0000000500754800ul &&
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_POS_EXPORT") == "1")
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] spirv.pos_export es=0x{_state.Program.Address:X16} " +
+                    $"pc=0x{instruction.Pc:X} mask=0x{export.EnableMask:X} " +
+                    $"compressed={(export.Compressed ? 1 : 0)} " +
+                    $"src=v{instruction.Sources[0].Value},v{instruction.Sources[1].Value}," +
+                    $"v{instruction.Sources[2].Value},v{instruction.Sources[3].Value}");
+            }
+
             var outputValue = _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
                 _vec4Type,
