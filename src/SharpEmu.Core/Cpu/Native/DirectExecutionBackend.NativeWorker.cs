@@ -29,9 +29,29 @@ public sealed partial class DirectExecutionBackend
 	private static readonly bool NativeGuestWorkersDisabled =
 		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS"), "1", StringComparison.Ordinal);
 
+	// Cap concurrent native-worker Runs. Astro's tbb_thead burst overlaps many
+	// UnmanagedCallersOnly prologues; a large prewarm + unbounded concurrency
+	// FailFasts (0xC0000409) mid-storm with no VEH breadcrumb. Pool size and
+	// in-flight Runs are separate knobs.
+	private static readonly int NativeWorkerMaxConcurrent = ReadNativeWorkerMaxConcurrent();
+
+	private static int ReadNativeWorkerMaxConcurrent()
+	{
+		if (int.TryParse(
+			    Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT"),
+			    out var parsed) &&
+		    parsed > 0)
+		{
+			return Math.Clamp(parsed, 1, 64);
+		}
+
+		return 2;
+	}
+
 	private readonly object _nativeWorkerGate = new();
 	private readonly List<NativeGuestExecutor> _allNativeWorkers = new();
 	private readonly Stack<NativeGuestExecutor> _idleNativeWorkers = new();
+	private readonly SemaphoreSlim _nativeWorkerRunLimiter = new(NativeWorkerMaxConcurrent);
 	private bool _nativeWorkersDisposed;
 	private int _nativeWorkerCreationFailedLogged;
 
@@ -61,84 +81,102 @@ public sealed partial class DirectExecutionBackend
 	// copied back into this thread's statics before returning.
 	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot, bool requireNativeWorker = false)
 	{
+		// Limit in-flight native Runs before renting so the idle pool is not
+		// drained by threads blocked on the concurrency gate.
+		_nativeWorkerRunLimiter.Wait();
 		NativeGuestExecutor? worker = null;
-		for (var attempt = 0; attempt < 48; attempt++)
-		{
-			worker = RentNativeGuestExecutor();
-			if (worker is not null)
-			{
-				break;
-			}
-
-			if (!requireNativeWorker)
-			{
-				break;
-			}
-
-			// TBB must not fall back to CallNativeEntry (managed VEH FailFast).
-			Thread.Sleep(1);
-		}
-
-		if (worker is null)
-		{
-			if (requireNativeWorker)
-			{
-				var n = Interlocked.Increment(ref _tbbNativeWorkerRefuseCount);
-				if (n <= 8 || n % 32 == 0)
-				{
-					Console.Error.WriteLine(
-						$"[LOADER][WARN] tbb_native_worker unavailable #{n}; " +
-						"refusing managed inline (would FailFast on execute AV)");
-					Console.Error.Flush();
-				}
-
-				throw new InvalidOperationException(
-					"Native guest worker unavailable for tbb_thead; refusing managed inline execution");
-			}
-
-			TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
-			return CallNativeEntry(entryStub);
-		}
-
 		try
 		{
-			var state = _activeGuestThreadState;
-			if (state is { Name: "tbb_thead" })
+			// Astro can spawn a burst of tbb_thead while workers are still in
+			// TerminateThread+respawn. Wait for a native worker — never fall back
+			// to managed inline (FailFast) and never throw (uncaught throw mid-
+			// storm was a silent process die).
+			var maxAttempts = requireNativeWorker ? 500 : 48;
+			for (var attempt = 0; attempt < maxAttempts; attempt++)
 			{
-				var n = Interlocked.Increment(ref _tbbNativeRunEnterCount);
-				if (n <= 12 || n % 64 == 0)
+				worker = RentNativeGuestExecutor();
+				if (worker is not null)
 				{
-					Console.Error.WriteLine(
-						$"[LOADER][INFO] tbb_run_enter #{n} native_tid_pending handle=0x{state.ThreadHandle:X16}");
-					Console.Error.Flush();
+					break;
 				}
+
+				if (!requireNativeWorker)
+				{
+					break;
+				}
+
+				Thread.Sleep(attempt < 32 ? 1 : 4);
 			}
 
-			var nativeReturn = worker.Run(
-				_activeCpuContext!,
-				state,
-				GuestThreadExecution.CurrentGuestThreadHandle,
-				_activeEntryReturnSentinelRip,
-				_activeGuestReturnSlotAddress,
-				(nint)hostRspSlot,
-				(nint)entryStub,
-				state?.AffinityMask ?? 0,
-				out var yieldRequested,
-				out var yieldReason,
-				out var forcedExit);
-			_activeGuestThreadYieldRequested = yieldRequested;
-			_activeGuestThreadYieldReason = yieldReason;
-			_activeForcedGuestExit = forcedExit;
-			return nativeReturn;
+			if (worker is null)
+			{
+				if (requireNativeWorker)
+				{
+					var n = Interlocked.Increment(ref _tbbNativeWorkerRefuseCount);
+					if (n <= 8 || n % 32 == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][ERROR] tbb_native_worker unavailable #{n} after {maxAttempts} attempts; " +
+							"skipping run (no managed inline, no throw)");
+						Console.Error.Flush();
+					}
+
+					_activeGuestThreadYieldRequested = true;
+					_activeGuestThreadYieldReason = "tbb_native_worker_unavailable";
+					_activeForcedGuestExit = true;
+					return unchecked((int)0x80020012);
+				}
+
+				TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
+				return CallNativeEntry(entryStub);
+			}
+
+			try
+			{
+				var state = _activeGuestThreadState;
+				if (state is { Name: "tbb_thead" })
+				{
+					var n = Interlocked.Increment(ref _tbbNativeRunEnterCount);
+					if (n <= 12 || n % 64 == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] tbb_run_enter #{n} native_tid_pending handle=0x{state.ThreadHandle:X16} " +
+							$"max_concurrent={NativeWorkerMaxConcurrent}");
+						Console.Error.Flush();
+					}
+				}
+
+				var nativeReturn = worker.Run(
+					_activeCpuContext!,
+					state,
+					GuestThreadExecution.CurrentGuestThreadHandle,
+					_activeEntryReturnSentinelRip,
+					_activeGuestReturnSlotAddress,
+					(nint)hostRspSlot,
+					(nint)entryStub,
+					state?.AffinityMask ?? 0,
+					out var yieldRequested,
+					out var yieldReason,
+					out var forcedExit);
+				_activeGuestThreadYieldRequested = yieldRequested;
+				_activeGuestThreadYieldReason = yieldReason;
+				_activeForcedGuestExit = forcedExit;
+				return nativeReturn;
+			}
+			finally
+			{
+				ReturnNativeGuestExecutor(worker);
+			}
 		}
 		finally
 		{
-			ReturnNativeGuestExecutor(worker);
+			_nativeWorkerRunLimiter.Release();
 		}
 	}
 
 	private static int _tbbNativeRunEnterCount;
 	private static int _tbbNativeWorkerRefuseCount;
+	internal static int _tbbWorkerPrologueFaultCount;
 
 	private void PrewarmNativeGuestWorkers(int count)
 	{
@@ -178,7 +216,8 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		Console.Error.WriteLine(
-			$"[LOADER][INFO] Native guest workers prewarmed: {warmed.Count}/{count}");
+			$"[LOADER][INFO] Native guest workers prewarmed: {warmed.Count}/{count} " +
+			$"max_concurrent={NativeWorkerMaxConcurrent}");
 		Console.Error.Flush();
 	}
 
@@ -603,7 +642,22 @@ public sealed partial class DirectExecutionBackend
 			forcedExit = _runForcedExit;
 			if (_runPrologueFailed)
 			{
-				throw new InvalidOperationException("Native guest worker failed to bind the run ambient (prologue fault)");
+				// Never throw out of the native-worker rent path: an uncaught
+				// exception mid-TBB storm kills the process with no FailFast
+				// breadcrumb.
+				var n = Interlocked.Increment(ref _tbbWorkerPrologueFaultCount);
+				if (n <= 8 || n % 32 == 0)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] tbb_worker prologue fault #{n}; soft-fail run " +
+						$"(tid={_nativeThreadId})");
+					Console.Error.Flush();
+				}
+
+				yieldRequested = true;
+				yieldReason = "tbb_worker_prologue_fault";
+				forcedExit = true;
+				return unchecked((int)0x80020012);
 			}
 			return _runNativeResult;
 		}
