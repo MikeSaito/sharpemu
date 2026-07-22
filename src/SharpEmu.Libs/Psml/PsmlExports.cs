@@ -251,6 +251,11 @@ public static class PsmlExports
     }
 
 
+    // Astro logo path: SizeInDwords then GetDispatchMfsrPacket900 (RUNLFro+qok).
+    // Unresolved 900 returns non-zero and trips GfxRenderStagePSSR.cpp:266.
+    private const int SoftPacketSizeInDwords = 0x80;
+    private const ulong SoftPacketSizeBytes = SoftPacketSizeInDwords * 4UL;
+
     [SysAbiExport(
         Nid = "AHalTX9wFZY",
         ExportName = "scePsmlMfsrGetDispatchMfsrPacketSizeInDwords",
@@ -258,12 +263,83 @@ public static class PsmlExports
         LibraryName = "libScePsml")]
     public static int PsmlMfsrGetDispatchMfsrPacketSizeInDwords(CpuContext ctx)
     {
-        // Astro title idle path polls this; unresolved returned 0 and spun with
-        // rdi=0x80-sized work buffers. Soft packet size keeps the path moving.
-        const int SoftPacketSizeInDwords = 0x80;
-        TracePsml($"mfsr_get_dispatch_packet_size_dwords -> 0x{SoftPacketSizeInDwords:X}");
-        return ctx.SetReturn(SoftPacketSizeInDwords);
+        // Logo/PSSR path: guest asserts ret == 0, then calls GetDispatchMfsrPacket900
+        // with rdi=SoftPacketSizeInDwords (observed 0x80). Returning the size in rax
+        // tripped :266 and skipped the 900 call (tDISP-s6). SCE_OK keeps the chain.
+        var arg0 = ctx[CpuRegister.Rdi];
+        TracePsml(
+            $"mfsr_get_dispatch_packet_size_dwords arg0=0x{arg0:X} " +
+            $"size=0x{SoftPacketSizeInDwords:X} ret=0");
+        return ctx.SetReturn(0);
     }
+
+    [SysAbiExport(
+        Nid = "RUNLFro+qok",
+        ExportName = "scePsmlMfsrGetDispatchMfsrPacket900",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePsml")]
+    public static int PsmlMfsrGetDispatchMfsrPacket900(CpuContext ctx) =>
+        SoftGetDispatchMfsrPacket(ctx, "900");
+
+    [SysAbiExport(
+        Nid = "s2psNHUIdjk",
+        ExportName = "scePsmlMfsrGetDispatchMfsrPacket1000",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePsml")]
+    public static int PsmlMfsrGetDispatchMfsrPacket1000(CpuContext ctx) =>
+        SoftGetDispatchMfsrPacket(ctx, "1000");
+
+    [SysAbiExport(
+        Nid = "94iBp3KvIuI",
+        ExportName = "scePsmlMfsrGetDispatchMfsrPacket1100",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePsml")]
+    public static int PsmlMfsrGetDispatchMfsrPacket1100(CpuContext ctx) =>
+        SoftGetDispatchMfsrPacket(ctx, "1100");
+
+    private static int SoftGetDispatchMfsrPacket(CpuContext ctx, string variant)
+    {
+        var arg0 = ctx[CpuRegister.Rdi];
+        var arg1 = ctx[CpuRegister.Rsi];
+        var arg2 = ctx[CpuRegister.Rdx];
+        var arg3 = ctx[CpuRegister.Rcx];
+        // Logo call shape (tDISP-s3): rdi=size_dwords (0x80), rsi/rdx = guest
+        // packet/param buffers. Clear the first mapped buffer arg.
+        var packetAddress = 0UL;
+        foreach (var candidate in new[] { arg1, arg2, arg3 })
+        {
+            if (candidate >= 0x10000)
+            {
+                packetAddress = candidate;
+                break;
+            }
+        }
+
+        var cleared = packetAddress != 0 && TryClearGuestBuffer(ctx, packetAddress, SoftPacketSizeBytes);
+        TracePsml(
+            $"mfsr_get_dispatch_packet_{variant} a0=0x{arg0:X16} a1=0x{arg1:X16} " +
+            $"a2=0x{arg2:X16} a3=0x{arg3:X16} packet=0x{packetAddress:X16} cleared={cleared}");
+        return ctx.SetReturn(0);
+    }
+
+    private static bool TryClearGuestBuffer(CpuContext ctx, ulong address, ulong length)
+    {
+        Span<byte> zeroes = stackalloc byte[4096];
+        zeroes.Clear();
+        for (ulong offset = 0; offset < length;)
+        {
+            var chunkSize = (int)Math.Min((ulong)zeroes.Length, length - offset);
+            if (!ctx.Memory.TryWrite(address + offset, zeroes[..chunkSize]))
+            {
+                return false;
+            }
+
+            offset += unchecked((uint)chunkSize);
+        }
+
+        return true;
+    }
+
     private static void TracePsml(string message)
     {
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PSML"), "1", StringComparison.Ordinal))
