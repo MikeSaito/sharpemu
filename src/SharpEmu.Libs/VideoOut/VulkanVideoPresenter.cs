@@ -15637,7 +15637,14 @@ internal static unsafe class VulkanVideoPresenter
         {
             value = value <= 1 && fallback > 1 ? fallback : value;
             minimum = Math.Max(minimum, 1u);
-            maximum = Math.Max(maximum, minimum);
+            // Minimized / unmapped Win32 surfaces often report MaxImageExtent=0.
+            // Clamping the fallback into [1,1] would create a useless 1x1
+            // swapchain; keep the last/default size instead.
+            if (maximum < minimum)
+            {
+                maximum = Math.Max(fallback, minimum);
+            }
+
             return Math.Clamp(value, minimum, maximum);
         }
 
@@ -15922,15 +15929,16 @@ internal static unsafe class VulkanVideoPresenter
                 : (uint)Math.Max(framebufferSize.Y, 0);
             if (surfaceWidth <= 1 || surfaceHeight <= 1)
             {
+                // Minimized / unmapped window reports 0x0. Deferring forever
+                // leaves an OutOfDate swapchain with no presents. ChooseExtent
+                // already clamps 0 to last/default size — recreate with that.
                 if (!_swapchainRecreateDeferred)
                 {
                     _swapchainRecreateDeferred = true;
                     Console.Error.WriteLine(
-                        $"[LOADER][INFO] Vulkan VideoOut deferred swapchain recreation: " +
-                        $"surface={surfaceWidth}x{surfaceHeight}");
+                        "[LOADER][INFO] Vulkan VideoOut swapchain recreate " +
+                        $"using fallback extent (window reported {surfaceWidth}x{surfaceHeight})");
                 }
-
-                return;
             }
 
             _swapchainRecreateDeferred = false;
